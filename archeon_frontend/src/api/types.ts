@@ -8,7 +8,7 @@ export const JobStatus = {
 
 export type JobStatusType = typeof JobStatus[keyof typeof JobStatus];
 
-export type JobType = 'text_to_3d' | 'image_to_3d';
+export type JobType = 'text_to_3d' | 'image_to_3d' | 'multiview';
 
 export type MeshOpsAction = 'decimate' | 'convert';
 
@@ -39,7 +39,15 @@ export interface ImageTo3DRequest extends BaseGenerationRequest {
     remove_background?: boolean;
 }
 
-export type JobRequest = TextTo3DRequest | ImageTo3DRequest;
+export interface MultiviewRequest extends BaseGenerationRequest {
+    type: 'multiview';
+    front: string; // Base64
+    back: string;
+    left: string;
+    right: string;
+}
+
+export type JobRequest = TextTo3DRequest | ImageTo3DRequest | MultiviewRequest;
 
 export interface JobResponse {
     uid: string;
