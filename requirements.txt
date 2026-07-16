@@ -43,3 +43,5 @@ onnxruntime
 pydantic==2.10.6
 psutil
 huggingface_hub
+# Server-Sent Events for the /v1/jobs/{uid}/events endpoint.
+sse-starlette>=2.0.0
