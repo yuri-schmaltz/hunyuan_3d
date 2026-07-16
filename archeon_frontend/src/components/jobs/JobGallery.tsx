@@ -10,11 +10,23 @@ const POLL_INTERVAL_MS = 2000;
 // Cap the exponential backoff so a flapping backend doesn't degrade to multi-minute polls.
 const MAX_POLL_BACKOFF_MS = 30_000;
 
+type StatusFilter = 'all' | JobStatusType;
+
+const STATUS_FILTERS: { key: StatusFilter; label: string }[] = [
+    { key: 'all', label: 'All' },
+    { key: JobStatus.QUEUED, label: 'Queued' },
+    { key: JobStatus.PROCESSING, label: 'Processing' },
+    { key: JobStatus.COMPLETED, label: 'Completed' },
+    { key: JobStatus.FAILED, label: 'Failed' },
+    { key: JobStatus.CANCELLED, label: 'Cancelled' },
+];
+
 export const JobGallery: React.FC = () => {
     const [jobs, setJobs] = useState<JobResponse[]>(() => []);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [previewingUid, setPreviewingUid] = useState<string | null>(null);
+    const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
     const inFlight = useRef(false);
     // Exponential backoff state for polling after a failure.
     const consecutiveFailures = useRef(0);
@@ -155,6 +167,36 @@ export const JobGallery: React.FC = () => {
                 </button>
             </h3>
 
+            {/* Status filter tabs. Counts are computed from the in-memory
+                job list so users see at a glance how many of each type
+                they have. */}
+            <div
+                role="tablist"
+                aria-label="Filter jobs by status"
+                className="flex flex-wrap gap-1 mb-3 text-xs"
+            >
+                {STATUS_FILTERS.map((f) => {
+                    const count = f.key === 'all' ? jobs.length : jobs.filter((j) => j.status === f.key).length;
+                    const isActive = statusFilter === f.key;
+                    return (
+                        <button
+                            key={f.key}
+                            role="tab"
+                            aria-selected={isActive}
+                            onClick={() => setStatusFilter(f.key)}
+                            className={`px-2 py-1 rounded transition-colors ${
+                                isActive
+                                    ? 'bg-archeon-primary text-white'
+                                    : 'bg-gray-800 text-gray-400 hover:text-white'
+                            }`}
+                        >
+                            {f.label}
+                            <span className="ml-1 opacity-70">({count})</span>
+                        </button>
+                    );
+                })}
+            </div>
+
             {error && (
                 <div role="alert" className="bg-rose-900/40 text-rose-200 text-sm p-2 rounded mb-3">
                     {error}
@@ -199,7 +241,18 @@ export const JobGallery: React.FC = () => {
                     <p className="text-gray-500 text-sm">No jobs found.</p>
                 )}
 
-                {jobs.map((job) => {
+                {(() => {
+                    const visible = statusFilter === 'all'
+                        ? jobs
+                        : jobs.filter((j) => j.status === statusFilter);
+                    if (jobs.length > 0 && visible.length === 0) {
+                        return (
+                            <p className="text-gray-500 text-sm">
+                                No jobs match the &ldquo;{STATUS_FILTERS.find((f) => f.key === statusFilter)?.label}&rdquo; filter.
+                            </p>
+                        );
+                    }
+                    return visible.map((job) => {
                     const isPreviewing = previewingUid === job.uid;
                     return (
                         <div
@@ -269,7 +322,8 @@ export const JobGallery: React.FC = () => {
                             </div>
                         </div>
                     );
-                })}
+                });
+                })()}
             </div>
         </div>
     );

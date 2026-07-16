@@ -1,0 +1,50 @@
+# Files excluded from the Docker build context to keep images small and
+# avoid leaking host state into the container.
+
+# Git
+.git
+.gitignore
+.worktrees/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Node
+archeon_frontend/node_modules/
+archeon_frontend/dist/
+archeon_frontend/.vite/
+
+# IDE / editor
+.vscode/
+.idea/
+.DS_Store
+
+# Docker-specific
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Docs / assets that don't need to ship in the image
+docs/
+assets/example_images/
+assets/example_mv_images/
+assets/qrcode/
+*.md
+LICENSE
+NOTICE
+
+# Tests (the production image doesn't need them)
+tests/
+
+# Generated model cache (mounted as a volume at runtime instead)
+.cache/

@@ -93,19 +93,19 @@ class TestPriorityRequestManager:
     def test_process_queue_executes_job_and_marks_completed(self):
         mgr = self._make_manager()
         req = TextTo3DRequest(prompt="a cat")
-        uid = _run(mgr.submit_job(req, save_dir="/tmp"))
 
-        # Run the worker loop briefly. The job should be picked up and completed.
-        _run(mgr.start())
-        try:
+        async def _scenario():
+            await mgr.start()
+            uid = await mgr.submit_job(req, save_dir="/tmp")
             # Wait for the worker to process the single queued job.
-            for _ in range(50):
+            for _ in range(300):
                 if mgr.jobs[uid].status in (JobStatus.COMPLETED, JobStatus.FAILED):
                     break
-                time.sleep(0.1)
-        finally:
-            _run(mgr.stop())
+                await asyncio.sleep(0.1)
+            await mgr.stop()
+            return uid
 
+        uid = _run(_scenario())
         assert mgr.jobs[uid].status == JobStatus.COMPLETED
         assert mgr.jobs[uid].file_path == "/tmp/fake.glb"
         assert mgr.jobs[uid].completed_at is not None
@@ -115,17 +115,18 @@ class TestPriorityRequestManager:
         mgr = self._make_manager()
         mgr.worker.generate = MagicMock(side_effect=RuntimeError("GPU OOM"))
         req = TextTo3DRequest(prompt="a cat")
-        uid = _run(mgr.submit_job(req, save_dir="/tmp"))
 
-        _run(mgr.start())
-        try:
-            for _ in range(50):
+        async def _scenario():
+            await mgr.start()
+            uid = await mgr.submit_job(req, save_dir="/tmp")
+            for _ in range(300):
                 if mgr.jobs[uid].status in (JobStatus.COMPLETED, JobStatus.FAILED):
                     break
-                time.sleep(0.1)
-        finally:
-            _run(mgr.stop())
+                await asyncio.sleep(0.1)
+            await mgr.stop()
+            return uid
 
+        uid = _run(_scenario())
         assert mgr.jobs[uid].status == JobStatus.FAILED
         assert "GPU OOM" in (mgr.jobs[uid].error or "")
 
@@ -144,16 +145,31 @@ class TestPriorityRequestManager:
 # ---------------------------------------------------------------------------
 
 class TestLazyWorkerInit:
-    def test_worker_init_called_only_on_first_job(self):
+    def test_worker_is_none_before_any_job(self):
         mgr = PriorityRequestManager(device="cpu")
-        mgr._init_worker = MagicMock(
-            return_value=MagicMock(generate=MagicMock(return_value="/tmp/x.glb"))
-        )
-        # Before any job, worker is None.
+        # No jobs have been submitted, so the worker has not been initialized.
         assert mgr.worker is None
-        # First job triggers init.
-        _run(mgr.submit_job(TextTo3DRequest(prompt="x"), save_dir="/tmp"))
-        assert mgr._init_worker.called
+
+    def test_worker_init_runs_on_first_job(self):
+        # The manager calls ModelWorker in a thread; we patch it out so the
+        # test is fast and doesn't require a GPU.
+        mgr = PriorityRequestManager(device="cpu")
+        fake_worker = MagicMock(generate=MagicMock(return_value="/tmp/x.glb"))
+
+        async def _scenario():
+            await mgr.start()
+            with patch("hy3dgen.api.manager.ModelWorker", return_value=fake_worker):
+                uid = await mgr.submit_job(TextTo3DRequest(prompt="x"), save_dir="/tmp")
+                # Wait briefly for the worker task to initialize ModelWorker.
+                for _ in range(50):
+                    if mgr.worker is not None:
+                        break
+                    await asyncio.sleep(0.05)
+            await mgr.stop()
+            return uid
+
+        _run(_scenario())
+        assert mgr.worker is not None
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +183,10 @@ class TestServerApp:
 
     def test_health_endpoint_registered(self):
         from hy3dgen.api.server import app
-        paths = {r.path for r in app.routes}
-        assert "/health" in paths  # launcher uses this
+        # FastAPI's app.openapi() aggregates every registered route across
+        # all included routers, so we can assert on the union.
+        paths = set(app.openapi().get("paths", {}).keys())
+        assert "/health" in paths
         assert "/v1/jobs" in paths
         assert "/v1/system/metrics" in paths
         assert "/v1/meshops/process" in paths

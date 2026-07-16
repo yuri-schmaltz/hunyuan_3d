@@ -32,6 +32,10 @@ class PriorityRequestManager:
         self.max_history = max_history
         self._evicted_total = 0
 
+        # Most recent worker error (string) so /health can surface it.
+        # Cleared automatically on the next successful job.
+        self.last_error: Optional[str] = None
+
         # Lazy initialization of the worker to speed up startup
         self.worker: Optional[ModelWorker] = None
         
@@ -225,6 +229,8 @@ class PriorityRequestManager:
             job.file_path = file_path
             job.completed_at = datetime.utcnow().isoformat()
             logger.info(f"Job {uid} completed successfully")
+            # Clear the last_error latch after a success.
+            self.last_error = None
 
         except Exception as e:
             logger.error(f"Job {uid} failed: {e}")
@@ -233,6 +239,8 @@ class PriorityRequestManager:
             job.status = JobStatus.FAILED
             job.error = str(e)
             job.completed_at = datetime.utcnow().isoformat()
+            # Track the most recent failure so /health can surface it.
+            self.last_error = f"{type(e).__name__}: {e}"
 
     def _aggressive_cleanup(self):
         """Perform aggressive garbage collection and bounded history cleanup."""

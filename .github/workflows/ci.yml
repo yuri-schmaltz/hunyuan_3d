@@ -37,7 +37,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
               torch==2.5.1
-          pip install pytest pytest-asyncio httpx pydantic==2.10.6
+          pip install pytest pytest-asyncio httpx pydantic==2.10.6 psutil trimesh mypy
+
+      - name: mypy (backend code we own)
+        # --follow-imports=silent so transitive imports from the vendored
+        # Hunyuan3D / diffusers stack don't pollute the error stream.
+        run: |
+          python -m mypy --follow-imports=silent --explicit-package-bases \
+              hy3dgen/api hy3dgen/cli.py
 
       - name: AST parse all backend modules
         run: |

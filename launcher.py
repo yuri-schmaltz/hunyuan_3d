@@ -250,9 +250,12 @@ def export_mesh(mesh, save_folder, textured=False, type='glb'):
 
 
 def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
+    # Gradio sends floats from number inputs; coerce to int so the rest of
+    # the pipeline never has to think about it. When ``randomize_seed`` is
+    # true we just pick a fresh seed in [0, MAX_SEED] and ignore the input.
     if randomize_seed:
-        seed = random.randint(0, MAX_SEED)
-    return seed
+        return random.randint(0, MAX_SEED)
+    return int(seed)
 
 
 def build_model_viewer_html(save_folder, height=660, width=790, textured=False):

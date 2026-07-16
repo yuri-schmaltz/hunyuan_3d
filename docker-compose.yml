@@ -1,0 +1,99 @@
+# docker-compose for the full Archeon 3D stack.
+#
+# Usage:
+#   docker compose up --build          # backend + frontend, GPU passthrough
+#   docker compose --profile tools up  # + a one-off CLI helper
+#
+# Environment overrides (put in a .env file next to this one):
+#   ARCHEON_API_KEY=changeme           # enables 0.0.0.0 bind and requires X-API-Key
+#   ARCHEON_CORS_ORIGINS=http://localhost:5173
+#   VITE_API_URL=http://localhost:9000
+#   HF_TOKEN=hf_xxx                    # for private model downloads
+#
+# Volumes:
+#   archeon-cache   - model + output cache (survives restarts)
+#   archeon-logs    - rotating file logs
+#
+# Hardware:
+#   The backend service requests 1 GPU. Remove / change the deploy.resources
+#   block to run on CPU (very slow) or on a different GPU count.
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: archeon-3d-backend:local
+    container_name: archeon-backend
+    restart: unless-stopped
+    environment:
+      ARCHEON_API_KEY: ${ARCHEON_API_KEY:-}
+      ARCHEON_CORS_ORIGINS: ${ARCHEON_CORS_ORIGINS:-http://localhost:5173,http://localhost:4173}
+      ARCHEON_ALLOW_CREDENTIALS: ${ARCHEON_ALLOW_CREDENTIALS:-false}
+      XDG_CACHE_HOME: /app/.cache
+      XDG_STATE_HOME: /app/.local/state
+      HF_TOKEN: ${HF_TOKEN:-}
+    ports:
+      - "9000:9000"
+    volumes:
+      - archeon-cache:/app/.cache
+      - archeon-logs:/app/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  frontend:
+    image: node:22-alpine
+    container_name: archeon-frontend
+    working_dir: /app
+    command: sh -c "npm ci && npm run build && npx vite preview --host 0.0.0.0 --port 4173"
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:9000}
+    ports:
+      - "4173:4173"
+    volumes:
+      - ./archeon_frontend:/app
+      - archeon-frontend-node:/app/node_modules
+    depends_on:
+      backend:
+        condition: service_healthy
+    profiles: ["default", "full"]
+
+  # Convenience profile: one-off CLI invocation, e.g.
+  #   docker compose --profile tools run --rm cli --help
+  #   docker compose --profile tools run --rm cli text "a red chair" --output chair.glb
+  cli:
+    image: archeon-3d-backend:local
+    container_name: archeon-cli
+    profiles: ["tools"]
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      ARCHEON_API_KEY: ${ARCHEON_API_KEY:-}
+      ARCHEON_API_URL: http://backend:9000
+    volumes:
+      - archeon-cache:/app/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    entrypoint: ["hy3dgen-cli"]
+
+volumes:
+  archeon-cache:
+  archeon-logs:
+  archeon-frontend-node:

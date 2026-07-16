@@ -160,6 +160,24 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 gradio_cache/
+
+# C++/CUDA extension build outputs
+hy3dgen/texgen/custom_rasterizer/lib/custom_rasterizer_kernel/build/
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local-only credentials (developer convenience, never commit)
+hy3dgen.local.env
+
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
