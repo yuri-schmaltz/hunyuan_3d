@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'fix/**', 'feature/**']
+  pull_request:
+    branches: [main]
+
+# Cancel an in-flight run of the same workflow on the same branch / PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Backend: Python syntax + Pydantic schema + API unit tests.
+  # GPU model code is mocked so this runs on a CPU-only runner.
+  # -----------------------------------------------------------------------
+  backend:
+    name: Backend (Python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install CPU-only torch + test deps
+        # CPU torch is enough: the tests under tests/test_api_server.py skip
+        # cleanly when torch is absent, and tests/test_api_models.py needs
+        # only pydantic. Installing torch lets the smoke `python -c "import
+        # hy3dgen.api.server"` step run without crashing on import.
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+              torch==2.5.1
+          pip install pytest pytest-asyncio httpx pydantic==2.10.6
+
+      - name: AST parse all backend modules
+        run: |
+          python -c "
+          import ast, sys
+          files = [
+              'launcher.py',
+              'hy3dgen/api/server.py', 'hy3dgen/api/manager.py',
+              'hy3dgen/api/routes.py', 'hy3dgen/api/schemas.py',
+              'hy3dgen/api/config.py', 'hy3dgen/api/deps.py',
+              'hy3dgen/inference.py', 'hy3dgen/monitoring.py',
+              'hy3dgen/meshops/processor.py', 'blender_addon.py',
+          ]
+          for f in files:
+              ast.parse(open(f).read())
+              print('OK', f)
+          "
+
+      - name: "Smoke import FastAPI app"
+        run: |
+          python -c "from hy3dgen.api.server import app; print(getattr(app, 'title', 'no title'))"
+
+      - name: Run pytest
+        run: pytest tests/ -v --tb=short
+
+  # -----------------------------------------------------------------------
+  # Frontend: type-check + lint + build.
+  # -----------------------------------------------------------------------
+  frontend:
+    name: Frontend (TS/Vite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: archeon_frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: archeon_frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npx tsc -b --noEmit
+      - run: npm run build

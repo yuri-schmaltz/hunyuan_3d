@@ -17,6 +17,7 @@ from hy3dgen.api.schemas import (
     MeshOpsRequest,
     MultiviewRequest,
     TextTo3DRequest,
+    TextureMeshRequest,
 )
 
 
@@ -116,6 +117,37 @@ class TestDiscriminatedUnion:
             "right": "Zg==",
         })
         assert isinstance(req, MultiviewRequest)
+
+    def test_texture_mesh_with_image_parses(self):
+        req = _job_adapter.validate_python({
+            "type": "texture_mesh",
+            "mesh": "Z2xiX2Jhc2U2NA==",
+            "image": "aW1hZ2VfYjY0",
+        })
+        assert isinstance(req, TextureMeshRequest)
+        assert req.has_reference is True
+        assert req.type == "texture_mesh"
+
+    def test_texture_mesh_with_prompt_parses(self):
+        req = _job_adapter.validate_python({
+            "type": "texture_mesh",
+            "mesh": "Z2xiX2Jhc2U2NA==",
+            "prompt": "weathered bronze",
+        })
+        assert isinstance(req, TextureMeshRequest)
+        assert req.has_reference is True
+
+    def test_texture_mesh_without_reference_is_constructible_but_invalid_for_dispatch(self):
+        # The schema allows the constructor without image/prompt (both are
+        # Optional) so the manager can return a clean 422-like error explaining
+        # what's missing instead of a Pydantic validation error at the boundary.
+        req = TextureMeshRequest(mesh="Z2xiX2Jhc2U2NA==")
+        assert req.has_reference is False
+
+    def test_texture_mesh_requires_mesh(self):
+        import pytest as _pt
+        with _pt.raises(ValidationError):
+            TextureMeshRequest(image="aW1hZ2VfYjY0")
 
     def test_invalid_type_rejected(self):
         with pytest.raises(ValidationError):

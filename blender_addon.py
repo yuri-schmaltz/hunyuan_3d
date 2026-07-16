@@ -263,19 +263,24 @@ class Hunyuan3DOperator(bpy.types.Operator):
             "texture": self.texture,
         }
         if self.selected_mesh_base64 and self.texture:
-            # Texturing an existing mesh: the backend currently does not have a
-            # dedicated mesh-texturing job type, so we fall back to image_to_3d
-            # when an image is provided, or report the unsupported case clearly.
+            # Re-texture an existing mesh. The backend now has a dedicated
+            # ``texture_mesh`` job type that accepts the mesh + an optional
+            # image (preferred) and/or text prompt as the texture reference.
+            payload = {"type": "texture_mesh", "mesh": self.selected_mesh_base64, **common}
+            # The base schema already sets texture=True via the discriminated
+            # union; clear it from common so the manager can re-impose True.
+            payload["texture"] = True
             if self.image_path and os.path.exists(self.image_path):
                 with open(self.image_path, "rb") as fh:
-                    img_b64 = base64.b64encode(fh.read()).decode()
-                payload = {"type": "image_to_3d", "image": img_b64, **common}
-                return payload
-            self._set_status_error(
-                "Mesh texturing requires an image path. Text-only mesh texturing is not "
-                "supported by the current API."
-            )
-            return None
+                    payload["image"] = base64.b64encode(fh.read()).decode()
+            elif self.prompt:
+                payload["prompt"] = self.prompt
+            else:
+                self._set_status_error(
+                    "Mesh texturing requires a reference image or a text prompt."
+                )
+                return None
+            return payload
         if self.image_path:
             if not os.path.exists(self.image_path):
                 self._set_status_error(f"Image not found: {self.image_path}")

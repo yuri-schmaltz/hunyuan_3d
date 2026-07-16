@@ -110,27 +110,41 @@ class PriorityRequestManager:
     async def _execute_model_worker(self, uid: str, request: JobRequest, save_dir: str):
         job = self.jobs[uid]
         job.status = JobStatus.PROCESSING
-        
+
         try:
+            # Validate texture_mesh has a reference (image or prompt) before
+            # spinning up the worker.
+            if request.type == 'texture_mesh' and not getattr(request, 'has_reference', False):
+                raise ValueError(
+                    "texture_mesh requires at least one of: image, prompt."
+                )
+
             # Initialize worker if needed (Lazy Loading)
             if self.worker is None:
                 logger.info("Initializing ModelWorker (Lazy Load)...")
                 # Blocking init logic, run in thread to avoid freezing API?
                 # Model loading is heavy.
                 self.worker = await asyncio.to_thread(
-                    ModelWorker, 
+                    ModelWorker,
                     device=self.device,
                     enable_tex=True, # Archeon default to enabled for now
                     enable_t2i=True
                 )
-            
+
             # Prepare params dict from Pydantic model
             params = request.model_dump()
-            
+
             # Map Pydantic fields to ModelWorker expectations
             if request.type == 'text_to_3d':
                 params['text'] = request.prompt
-            
+            elif request.type == 'texture_mesh':
+                # texture_mesh implies texture=True; ModelWorker also expects the
+                # mesh (base64) to be present in params under the 'mesh' key, and
+                # a guidance image/prompt under 'image'/'text'.
+                params['texture'] = True
+                if request.prompt and 'text' not in params:
+                    params['text'] = request.prompt
+
             # Run generation in thread
             logger.info(f"Starting generation for job {uid}")
             file_path = await asyncio.to_thread(
@@ -139,7 +153,7 @@ class PriorityRequestManager:
                 params,
                 save_dir
             )
-            
+
             job.status = JobStatus.COMPLETED
             job.file_path = file_path
             job.completed_at = datetime.utcnow().isoformat()
