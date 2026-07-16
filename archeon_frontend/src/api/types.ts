@@ -51,19 +51,18 @@ export interface JobResponse {
 }
 
 export interface SystemMetrics {
-    uptime: number;
+    /** Seconds since the backend process started. */
+    uptime_seconds: number;
+    /** CPU utilization of the backend process (0–100). */
     cpu_percent: number;
-    memory: {
-        total: number;
-        available: number;
-        percent: number;
-        used: number
-    };
+    /** Resident set size of the backend process, in MB. */
+    rss_mb: number;
+    /** Virtual memory size of the backend process, in MB. */
+    vms_mb: number;
     gpu?: {
         name: string;
-        total_memory: number;
-        free_memory: number;
-        used_memory: number;
-        utilization: number;
+        memory_allocated_mb: number;
+        memory_reserved_mb: number;
+        memory_total_mb: number;
     };
 }

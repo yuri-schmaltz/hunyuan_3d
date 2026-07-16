@@ -1,73 +1,65 @@
-# React + TypeScript + Vite
+# Archeon 3D — Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + TypeScript + Vite UI for the [Archeon 3D](https://github.com/yuri-schmaltz/my-hunyuan-3D) backend.
 
-Currently, two official plugins are available:
+The backend is the FastAPI server in `../hy3dgen/api/server.py` (entry point `hy3dgen-api`).
+This app talks to it over HTTP and polls the `/v1/jobs` and `/v1/system/metrics` endpoints.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## Stack
 
-## React Compiler
+- React 19 + TypeScript 5.9
+- Vite 7 (dev server + bundler)
+- Tailwind CSS v4 (via `@tailwindcss/vite`)
+- Axios for HTTP
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Prerequisites
 
-## Expanding the ESLint configuration
+- Node.js ≥ 20
+- A running Archeon 3D backend (see the project root README)
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## Setup
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+cp .env.example .env       # then edit VITE_API_URL if your backend is not on localhost:9000
+npm run dev                # http://localhost:5173
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Scripts
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+| Script | Purpose |
+| --- | --- |
+| `npm run dev` | Vite dev server with HMR |
+| `npm run build` | Type-check (`tsc -b`) + production build to `dist/` |
+| `npm run preview` | Serve the production build locally |
+| `npm run lint` | ESLint (flat config) |
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+## Environment variables
+
+| Name | Default | Description |
+| --- | --- | --- |
+| `VITE_API_URL` | `http://localhost:9000` | Backend base URL. The app appends `/v1` itself. |
+
+## Project layout
+
 ```
+src/
+├── api/                      # HTTP client + shared types
+│   ├── client.ts             # Axios instance, reads VITE_API_URL
+│   └── types.ts              # JobStatus, JobRequest, SystemMetrics, etc.
+├── components/
+│   ├── common/               # Cross-cutting (ErrorBoundary, …)
+│   ├── jobs/                 # CreateJobForm, JobGallery
+│   └── monitoring/           # SystemMonitor
+├── App.tsx                   # Top-level layout
+├── main.tsx                  # React root + ErrorBoundary wrap
+└── index.css                 # Tailwind theme tokens
+```
+
+## Conventions
+
+- All async API calls go through `apiClient` (never `fetch` directly).
+- Polling components check `document.hidden` and pause when the tab is in the
+  background.
+- `<form>` inputs always use a paired `<label htmlFor>` / `id`.
+- Status-driven UI uses the typed `JobStatus` const, not raw strings.

@@ -5,7 +5,7 @@ import type { JobResponse } from '../../api/types';
 import { RefreshCw, CheckCircle, Clock, XCircle, AlertTriangle, Download, Scissors } from 'lucide-react';
 
 export const JobGallery: React.FC = () => {
-    const [jobs, setJobs] = useState<JobResponse[]>([]);
+    const [jobs, setJobs] = useState<JobResponse[]>(() => []);
 
     const fetchJobs = async () => {
         try {
@@ -18,9 +18,17 @@ export const JobGallery: React.FC = () => {
     };
 
     useEffect(() => {
-        fetchJobs();
-        const interval = setInterval(fetchJobs, 2000); // Polling every 2s
-        return () => clearInterval(interval);
+        // Schedule the first fetch on the next tick so the initial setState
+        // doesn't cascade inside the effect body.
+        const initial = setTimeout(fetchJobs, 0);
+        const interval = setInterval(() => {
+            if (document.hidden) return; // pause polling when tab is in background
+            void fetchJobs();
+        }, 2000);
+        return () => {
+            clearTimeout(initial);
+            clearInterval(interval);
+        };
     }, []);
 
     const handleOptimize = async (e: React.MouseEvent, uid: string) => {

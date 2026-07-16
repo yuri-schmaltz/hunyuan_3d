@@ -41,11 +41,24 @@ app.mount("/files", StaticFiles(directory=SAVE_DIR), name="files")
 app.include_router(router)
 
 if __name__ == "__main__":
+    main()
+
+
+def main():
+    """Console entry point declared in setup.py: ``hy3dgen-api``."""
     import uvicorn
     import argparse
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Archeon 3D Backend API server")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument(
+        "--workers", type=int, default=1,
+        help="Number of uvicorn workers. Use >1 only if the model is loaded lazily per worker.",
+    )
     args = parser.parse_args()
-    
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(
+        "hy3dgen.api.server:app",
+        host=args.host,
+        port=args.port,
+        workers=args.workers,
+    )

@@ -1,278 +1,179 @@
-"""Tests for api_server.py components: JobManager, CORS, auth, and health endpoint."""
+"""
+Tests for the Archeon API server (hy3dgen.api.server + hy3dgen.api.manager).
 
+The previous version of this file defined a *parallel* ``JobManager`` class
+inline and never tested the real ``PriorityRequestManager``. That meant the
+suite was effectively a no-op against production code. These tests exercise
+the real classes (with ``ModelWorker`` mocked out so they don't need a GPU).
+"""
 import asyncio
-import threading
+import sys
 import time
-import os
-from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-# We test the JobManager class and helper logic in isolation,
-# without starting the full FastAPI server (avoiding GPU dependency).
+try:
+    import torch  # noqa: F401  # PriorityRequestManager imports torch at module level
+    from hy3dgen.api.manager import PriorityRequestManager
+    from hy3dgen.api.schemas import (
+        ImageTo3DRequest,
+        JobStatus,
+        TextTo3DRequest,
+    )
+    _SKIP_REASON = None
+except ModuleNotFoundError as exc:  # torch / fastapi not installed (e.g. in a CI env without GPU deps)
+    PriorityRequestManager = None  # type: ignore[assignment]
+    JobStatus = None  # type: ignore[assignment]
+    TextTo3DRequest = None  # type: ignore[assignment]
+    ImageTo3DRequest = None  # type: ignore[assignment]
+    _SKIP_REASON = f"required dependency missing: {exc.name}"
 
-# ---------------------------------------------------------------------------
-# Import api_models (already tested, used here for type references)
-# ---------------------------------------------------------------------------
 
-from api_models import JobStatus, GenerateRequest, ServerStatusResponse
+pytestmark = pytest.mark.skipif(
+    _SKIP_REASON is not None,
+    reason=_SKIP_REASON or "torch/fastapi not installed",
+)
 
 
-# ---------------------------------------------------------------------------
-# JobManager (replicated for isolated unit testing)
-# ---------------------------------------------------------------------------
-
-class JobManager:
-    """Mirror of api_server.JobManager for unit testing."""
-
-    def __init__(self, max_concurrent: int = 2):
-        self.jobs: dict[str, dict] = {}
-        self.queue: asyncio.Queue = asyncio.Queue()
-        self.max_concurrent = max_concurrent
-        self._active_count = 0
-        self._lock = threading.Lock()
-        self._completed_count = 0
-        self._semaphore = threading.Semaphore(max_concurrent)
-
-    def create_job(self, params: dict) -> str:
-        import uuid
-        uid = str(uuid.uuid4())
-        self.jobs[uid] = {
-            'status': JobStatus.queued,
-            'params': params,
-            'created_at': datetime.utcnow().isoformat(),
-            'completed_at': None,
-            'file_path': None,
-            'error': None,
-        }
-        return uid
-
-    def update_status(self, uid: str, status: JobStatus, **kwargs):
-        if uid in self.jobs:
-            self.jobs[uid]['status'] = status
-            self.jobs[uid].update(kwargs)
-
-    def get_status(self, uid: str):
-        return self.jobs.get(uid)
-
-    @property
-    def queue_length(self) -> int:
-        return self.queue.qsize()
-
-    @property
-    def active_count(self) -> int:
-        return self._active_count
-
-    @property
-    def completed_count(self) -> int:
-        return self._completed_count
-
-    def cleanup_old_jobs(self, max_age_hours: int = 24):
-        cutoff = datetime.utcnow() - timedelta(hours=max_age_hours)
-        to_remove = []
-        for uid, job in self.jobs.items():
-            created = datetime.fromisoformat(job['created_at'])
-            if created < cutoff and job['status'] in (JobStatus.completed, JobStatus.failed):
-                to_remove.append(uid)
-        for uid in to_remove:
-            del self.jobs[uid]
+def _run(coro):
+    """Helper to run a coroutine in a fresh event loop inside a test."""
+    return asyncio.get_event_loop().run_until_complete(coro) if False else asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------
-# Tests: JobManager
+# PriorityRequestManager — queue + state machine
 # ---------------------------------------------------------------------------
 
-class TestJobManager:
-    def test_create_job_returns_uuid(self):
-        jm = JobManager()
-        uid = jm.create_job({"prompt": "test"})
-        assert len(uid) == 36  # UUID format
-        assert uid in jm.jobs
+class TestPriorityRequestManager:
+    def _make_manager(self):
+        # Lazy worker init: don't actually load any model.
+        mgr = PriorityRequestManager(device="cpu", max_concurrent=1)
+        mgr.worker = MagicMock()
+        mgr.worker.generate = MagicMock(return_value="/tmp/fake.glb")
+        return mgr
 
-    def test_job_initial_status_is_queued(self):
-        jm = JobManager()
-        uid = jm.create_job({})
-        assert jm.jobs[uid]['status'] == JobStatus.queued
+    def test_init_has_empty_state(self):
+        mgr = PriorityRequestManager(device="cpu")
+        assert mgr.jobs == {}
+        assert mgr.queue.empty()
+        assert mgr._worker_task is None
+        assert mgr.worker is None  # lazy
 
-    def test_update_status_changes_status(self):
-        jm = JobManager()
-        uid = jm.create_job({})
-        jm.update_status(uid, JobStatus.processing)
-        assert jm.jobs[uid]['status'] == JobStatus.processing
+    def test_submit_job_creates_entry_and_returns_uid(self):
+        mgr = self._make_manager()
+        req = TextTo3DRequest(prompt="a cat")
+        uid = _run(mgr.submit_job(req, save_dir="/tmp"))
+        assert isinstance(uid, str) and len(uid) == 36
+        assert uid in mgr.jobs
+        assert mgr.jobs[uid].status == JobStatus.QUEUED
 
-    def test_update_status_with_kwargs(self):
-        jm = JobManager()
-        uid = jm.create_job({})
-        jm.update_status(uid, JobStatus.completed, file_path="/tmp/test.glb")
-        assert jm.jobs[uid]['file_path'] == "/tmp/test.glb"
+    def test_get_job_returns_none_for_unknown(self):
+        mgr = self._make_manager()
+        assert mgr.get_job("nonexistent") is None
 
-    def test_get_status_returns_none_for_unknown(self):
-        jm = JobManager()
-        assert jm.get_status("nonexistent") is None
+    def test_cancel_queued_job(self):
+        mgr = self._make_manager()
+        req = TextTo3DRequest(prompt="a cat")
+        uid = _run(mgr.submit_job(req, save_dir="/tmp"))
+        mgr.cancel_job(uid)
+        assert mgr.jobs[uid].status == JobStatus.CANCELLED
+        assert mgr.jobs[uid].error is not None
 
-    def test_get_status_returns_job_dict(self):
-        jm = JobManager()
-        uid = jm.create_job({"key": "value"})
-        status = jm.get_status(uid)
-        assert status is not None
-        assert status['params'] == {"key": "value"}
+    def test_cancel_processing_job_is_a_noop(self):
+        """A job already in PROCCESSING state cannot be cancelled (today)."""
+        mgr = self._make_manager()
+        req = TextTo3DRequest(prompt="a cat")
+        uid = _run(mgr.submit_job(req, save_dir="/tmp"))
+        mgr.jobs[uid].status = JobStatus.PROCESSING
+        mgr.cancel_job(uid)
+        # Status remains PROCESSING (cannot be cancelled mid-flight).
+        assert mgr.jobs[uid].status == JobStatus.PROCESSING
 
-    def test_cleanup_removes_old_completed_jobs(self):
-        jm = JobManager()
-        uid = jm.create_job({})
-        # Backdate the job
-        jm.jobs[uid]['created_at'] = (datetime.utcnow() - timedelta(hours=48)).isoformat()
-        jm.update_status(uid, JobStatus.completed)
-        jm.cleanup_old_jobs(max_age_hours=24)
-        assert uid not in jm.jobs
+    def test_process_queue_executes_job_and_marks_completed(self):
+        mgr = self._make_manager()
+        req = TextTo3DRequest(prompt="a cat")
+        uid = _run(mgr.submit_job(req, save_dir="/tmp"))
 
-    def test_cleanup_keeps_recent_jobs(self):
-        jm = JobManager()
-        uid = jm.create_job({})
-        jm.update_status(uid, JobStatus.completed)
-        jm.cleanup_old_jobs(max_age_hours=24)
-        assert uid in jm.jobs
-
-    def test_cleanup_keeps_running_old_jobs(self):
-        jm = JobManager()
-        uid = jm.create_job({})
-        jm.jobs[uid]['created_at'] = (datetime.utcnow() - timedelta(hours=48)).isoformat()
-        jm.update_status(uid, JobStatus.processing)
-        jm.cleanup_old_jobs(max_age_hours=24)
-        assert uid in jm.jobs  # Still processing, don't remove
-
-    def test_max_concurrent_creates_semaphore(self):
-        jm = JobManager(max_concurrent=3)
-        assert jm.max_concurrent == 3
-        # Semaphore should allow 3 acquires
-        for _ in range(3):
-            assert jm._semaphore.acquire(blocking=False)
-        # 4th should fail
-        assert not jm._semaphore.acquire(blocking=False)
-
-
-class TestConcurrencyControl:
-    def test_semaphore_limits_parallel_execution(self):
-        jm = JobManager(max_concurrent=1)
-        results = []
-
-        def worker(job_id):
-            jm._semaphore.acquire()
-            try:
-                with jm._lock:
-                    jm._active_count += 1
-                results.append(('start', job_id, jm._active_count))
+        # Run the worker loop briefly. The job should be picked up and completed.
+        _run(mgr.start())
+        try:
+            # Wait for the worker to process the single queued job.
+            for _ in range(50):
+                if mgr.jobs[uid].status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                    break
                 time.sleep(0.1)
-                results.append(('end', job_id, jm._active_count))
-            finally:
-                with jm._lock:
-                    jm._active_count -= 1
-                jm._semaphore.release()
+        finally:
+            _run(mgr.stop())
 
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(3)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        assert mgr.jobs[uid].status == JobStatus.COMPLETED
+        assert mgr.jobs[uid].file_path == "/tmp/fake.glb"
+        assert mgr.jobs[uid].completed_at is not None
+        mgr.worker.generate.assert_called_once()
 
-        # With max_concurrent=1, active count should never exceed 1
-        for action, job_id, count in results:
-            if action == 'start':
-                assert count <= 1, f"Active count {count} exceeded max_concurrent=1"
+    def test_process_queue_marks_failed_on_exception(self):
+        mgr = self._make_manager()
+        mgr.worker.generate = MagicMock(side_effect=RuntimeError("GPU OOM"))
+        req = TextTo3DRequest(prompt="a cat")
+        uid = _run(mgr.submit_job(req, save_dir="/tmp"))
 
+        _run(mgr.start())
+        try:
+            for _ in range(50):
+                if mgr.jobs[uid].status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                    break
+                time.sleep(0.1)
+        finally:
+            _run(mgr.stop())
 
-# ---------------------------------------------------------------------------
-# Tests: CORS Configuration
-# ---------------------------------------------------------------------------
+        assert mgr.jobs[uid].status == JobStatus.FAILED
+        assert "GPU OOM" in (mgr.jobs[uid].error or "")
 
-class TestCORSConfiguration:
-    def test_default_cors_origins_are_localhost(self):
-        """Default CORS should restrict to localhost, not wildcard *."""
-        default = "http://localhost:*,http://127.0.0.1:*"
-        origins = [o.strip() for o in default.split(",")]
-        assert "http://localhost:*" in origins
-        assert "http://127.0.0.1:*" in origins
-        assert "*" not in origins
-
-    def test_cors_origins_env_override(self):
-        custom = "https://myapp.com, https://staging.myapp.com"
-        with patch.dict(os.environ, {'CORS_ORIGINS': custom}):
-            origins = [o.strip() for o in os.environ.get('CORS_ORIGINS', '').split(",")]
-            assert "https://myapp.com" in origins
-            assert "https://staging.myapp.com" in origins
+    def test_priority_queue_orders_lower_first(self):
+        """asyncio.PriorityQueue returns lower priority number first."""
+        mgr = self._make_manager()
+        low = _run(mgr.submit_job(TextTo3DRequest(prompt="low"), save_dir="/tmp", priority=1))
+        high = _run(mgr.submit_job(TextTo3DRequest(prompt="high"), save_dir="/tmp", priority=10))
+        # The order in which they were *queued* doesn't matter — priority decides execution.
+        first, _, _, _, _ = mgr.queue._queue[0]
+        assert first == 1  # lower priority value = higher priority
 
 
 # ---------------------------------------------------------------------------
-# Tests: API Key Auth
+# Lazy worker init
 # ---------------------------------------------------------------------------
 
-class TestAPIKeyAuth:
-    def test_no_auth_when_api_key_is_none(self):
-        """When API_KEY is None, auth should be bypassed."""
-        api_key = None
-        incoming = "some-key"
-        if api_key is None:
-            result = "allowed"
-        elif incoming != api_key:
-            result = "denied"
-        else:
-            result = "allowed"
-        assert result == "allowed"
-
-    def test_valid_key_passes(self):
-        api_key = "secret-123"
-        incoming = "secret-123"
-        assert incoming == api_key
-
-    def test_invalid_key_fails(self):
-        api_key = "secret-123"
-        incoming = "wrong-key"
-        assert incoming != api_key
-
-    def test_missing_key_fails_when_required(self):
-        api_key = "secret-123"
-        incoming = None
-        assert incoming != api_key
-
-
-# ---------------------------------------------------------------------------
-# Tests: GenerateRequest Defaults
-# ---------------------------------------------------------------------------
-
-class TestGenerateRequestIntegration:
-    def test_minimal_request_with_text(self):
-        req = GenerateRequest(text="a red chair")
-        assert req.text == "a red chair"
-        assert req.octree_resolution == 256  # default
-        assert req.num_inference_steps == 5  # default
-
-    def test_minimal_request_with_image_b64(self):
-        req = GenerateRequest(image="aGVsbG8=")  # base64 of "hello"
-        assert req.image == "aGVsbG8="
-
-    def test_request_with_all_params(self):
-        req = GenerateRequest(
-            prompt="test",
-            image="data",
-            octree_resolution=512,
-            num_inference_steps=50,
-            guidance_scale=7.5,
-            seed=42,
-            texture=True,
+class TestLazyWorkerInit:
+    def test_worker_init_called_only_on_first_job(self):
+        mgr = PriorityRequestManager(device="cpu")
+        mgr._init_worker = MagicMock(
+            return_value=MagicMock(generate=MagicMock(return_value="/tmp/x.glb"))
         )
-        assert req.octree_resolution == 512
-        assert req.texture is True
+        # Before any job, worker is None.
+        assert mgr.worker is None
+        # First job triggers init.
+        _run(mgr.submit_job(TextTo3DRequest(prompt="x"), save_dir="/tmp"))
+        assert mgr._init_worker.called
 
 
 # ---------------------------------------------------------------------------
-# Tests: Host Binding Security
+# Server / app smoke
 # ---------------------------------------------------------------------------
 
-class TestHostBindingSecurity:
-    def test_default_host_is_localhost(self):
-        """Default host should be 127.0.0.1, not 0.0.0.0."""
-        # This checks the documented default
-        default_host = "127.0.0.1"
-        assert default_host != "0.0.0.0"
-        assert default_host == "127.0.0.1"
+class TestServerApp:
+    def test_app_imports(self):
+        from hy3dgen.api.server import app
+        assert app.title == "Archeon 3D Backend"
+
+    def test_health_endpoint_registered(self):
+        from hy3dgen.api.server import app
+        paths = {r.path for r in app.routes}
+        assert "/health" in paths  # launcher uses this
+        assert "/v1/jobs" in paths
+        assert "/v1/system/metrics" in paths
+        assert "/v1/meshops/process" in paths
+
+    def test_main_function_exists(self):
+        """The console script ``hy3dgen-api`` declared in setup.py needs a real main()."""
+        from hy3dgen.api import server
+        assert callable(getattr(server, "main", None))

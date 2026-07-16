@@ -84,8 +84,20 @@ HAS_T2I = False
 
 
 # --- Helper for GPU Poor (mmgp) ---
-def replace_property_getter(obj, name, getter):
-    type(obj).name = property(fget=getter)
+def replace_property_getter(instance, property_name, new_getter):
+    """Subclass the instance to override a property getter without mutating the original class.
+
+    The earlier global monkey-patch version (which set the property on ``type(obj)`` directly)
+    would affect every instance of the class globally and was unsafe under concurrent
+    requests. This subclassing variant scopes the override to a single instance.
+    """
+    original_class = type(instance)
+    original_property = getattr(original_class, property_name)
+    custom_class = type(f'Custom{original_class.__name__}', (original_class,), {})
+    new_property = property(new_getter, original_property.fset)
+    setattr(custom_class, property_name, new_property)
+    instance.__class__ = custom_class
+    return instance
 
 
 def get_rmbg_worker():
@@ -160,28 +172,6 @@ def get_t2i_worker():
         t2i_worker = HunyuanDiTPipeline('Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled')
         HAS_T2I = True
         # Memory Management
-        pipe = offload.extract_models("t2i_worker", t2i_worker)
-        offload.profile(pipe, profile_no=int(args.profile), verboseLevel=int(args.verbose))
-    return t2i_worker
-
-
-def get_postprocessors():
-    global floater_remove_worker, degenerate_face_remove_worker, face_reduce_worker
-    if floater_remove_worker is None:
-        from hy3dgen.shapegen import FaceReducer, FloaterRemover, DegenerateFaceRemover
-        floater_remove_worker = FloaterRemover()
-        degenerate_face_remove_worker = DegenerateFaceRemover()
-        face_reduce_worker = FaceReducer()
-    return floater_remove_worker, degenerate_face_remove_worker, face_reduce_worker
-
-
-def get_t2i_worker():
-    global t2i_worker, HAS_T2I
-    if t2i_worker is None: # T2I always available if enabled
-        from hy3dgen.text2image import HunyuanDiTPipeline
-        logger.info("Initializing Text-to-Image Generator...")
-        t2i_worker = HunyuanDiTPipeline('Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled')
-        HAS_T2I = True
         pipe = offload.extract_models("t2i_worker", t2i_worker)
         offload.profile(pipe, profile_no=int(args.profile), verboseLevel=int(args.verbose))
     return t2i_worker
@@ -896,16 +886,6 @@ def build_app():
 
 
     return demo
-
-
-def replace_property_getter(instance, property_name, new_getter):
-    original_class = type(instance)
-    original_property = getattr(original_class, property_name)
-    custom_class = type(f'Custom{original_class.__name__}', (original_class,), {})
-    new_property = property(new_getter, original_property.fset)
-    setattr(custom_class, property_name, new_property)
-    instance.__class__ = custom_class
-    return instance
 
 
 def main():

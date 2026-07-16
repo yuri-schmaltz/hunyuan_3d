@@ -1,7 +1,11 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { apiClient } from '../../api/client';
 import type { JobRequest, JobType } from '../../api/types';
 import { Wand2, Image as ImageIcon, Loader2 } from 'lucide-react';
+
+// Cap user uploads so a stray 500 MB PNG doesn't OOM the tab or the backend.
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MB
+const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
 
 export const CreateJobForm: React.FC = () => {
     const [mode, setMode] = useState<JobType>('text_to_3d');
@@ -16,12 +20,31 @@ export const CreateJobForm: React.FC = () => {
     const [guidance, setGuidance] = useState(5.0);
     const [seed, setSeed] = useState(1234);
 
+    // Revoke any previous object URL when it changes or on unmount, so blobs
+    // aren't pinned in memory until page reload.
+    useEffect(() => {
+        return () => {
+            if (previewUrl) URL.revokeObjectURL(previewUrl);
+        };
+    }, [previewUrl]);
+
     const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-        if (e.target.files && e.target.files[0]) {
-            const file = e.target.files[0];
-            setSelectedImage(file);
-            setPreviewUrl(URL.createObjectURL(file));
+        const file = e.target.files?.[0];
+        if (!file) return;
+        if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+            setMessage({ type: 'error', text: `Unsupported image type: ${file.type || 'unknown'}. Use PNG, JPEG, or WebP.` });
+            return;
         }
+        if (file.size > MAX_IMAGE_BYTES) {
+            setMessage({ type: 'error', text: `Image too large (${(file.size / 1024 / 1024).toFixed(1)} MB). Max ${MAX_IMAGE_BYTES / 1024 / 1024} MB.` });
+            return;
+        }
+        setSelectedImage(file);
+        setPreviewUrl((prev) => {
+            if (prev) URL.revokeObjectURL(prev);
+            return URL.createObjectURL(file);
+        });
+        setMessage(null);
     };
 
     const convertToBase64 = (file: File): Promise<string> => {
@@ -66,10 +89,13 @@ export const CreateJobForm: React.FC = () => {
 
             await apiClient.post('/jobs', request);
             setMessage({ type: 'success', text: 'Job submitted successfully!' });
-            // Ideally trigger refresh of job list
-        } catch (err: any) {
+            // TODO: notify JobGallery to refresh (lift state or use a query layer).
+        } catch (err) {
             console.error(err);
-            setMessage({ type: 'error', text: err.response?.data?.detail || err.message || 'Submission failed' });
+            const detail = (err as { response?: { data?: { detail?: string } } })
+                ?.response?.data?.detail;
+            const message = err instanceof Error ? err.message : 'Submission failed';
+            setMessage({ type: 'error', text: detail ?? message });
         } finally {
             setIsSubmitting(false);
         }
@@ -144,10 +170,6 @@ export const CreateJobForm: React.FC = () => {
                     </div>
                     <div>
                         <label className="block text-xs text-gray-500 mb-1">Guidance ({guidance})</label>
-                        <input
-                            type="range" min="1" max="20" step="0.5" value={guidance} onChange={(e) => setGuidance(Number(e.target.value))}
-                            className="w-full accent-archeon-primary"
-                        />
                         <input
                             type="range" min="1" max="20" step="0.5" value={guidance} onChange={(e) => setGuidance(Number(e.target.value))}
                             className="w-full accent-archeon-primary"

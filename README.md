@@ -207,28 +207,16 @@ You may follow the next steps to use Hunyuan3D 2.0 via:
 
 ### Installation
 
-#### Automated Installation (Recommended)
+#### Manual Installation (Recommended)
 
-Simply run the included installer script. It handles virtual environment creation, dependencies, and compiling the custom texture engine:
-
-```bash
-python3 install.py
-```
-
-After installation completes, activate the environment:
-
-```bash
-source .venv/bin/activate
-```
-
-#### Manual Installation
-
-If you prefer to manage your own environment (e.g., Conda):
+`pip install -e .` will read `requirements.txt`, install the Python deps, and
+build the C++ custom rasterizer (if CUDA is available). For a clean environment,
+use a venv or Conda first:
 
 ```bash
 # 1. Create environment (Python 3.10 recommended)
-conda create -n Hunyuan3D-2GP python==3.10.9
-conda activate Hunyuan3D-2GP
+python3 -m venv .venv
+source .venv/bin/activate
 
 # 2. Install PyTorch (adjust CUDA version if needed)
 pip install torch==2.5.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu124

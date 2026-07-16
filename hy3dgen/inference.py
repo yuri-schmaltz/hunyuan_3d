@@ -114,8 +114,12 @@ class ModelWorker:
             seed = params.get('seed', 1234)
             generator = torch.Generator(self.device).manual_seed(seed)
             octree_resolution = params.get('octree_resolution', 256)
-            num_inference_steps = params.get('num_inference_steps', 5)
-            guidance_scale = params.get('guidance_scale', 5.0)
+            # Field names align with hy3dgen.api.schemas.BaseGenerationRequest
+            # (steps / guidance). The previous code read num_inference_steps /
+            # guidance_scale, which were never sent by the API client and resulted
+            # in the user-supplied values being silently ignored.
+            num_inference_steps = params.get('steps', 50)
+            guidance_scale = params.get('guidance', 5.0)
 
             start_time = time.time()
             mesh = self.pipeline(
@@ -142,18 +146,23 @@ class ModelWorker:
                 logger.info(f"Texture generation took {time.time() - start_time:.2f}s")
 
         # --- Export ---
-        file_type = params.get('type', 'glb')
-        
+        # ``format`` (not ``type``) is the output format field. ``type`` is the
+        # Pydantic discriminator on JobRequest and would have produced an
+        # extension like ``.text_to_3d`` for every export.
+        file_type = params.get('format', 'glb')
+        if file_type not in ('glb', 'obj', 'ply', 'stl'):
+            logger.warning(f"Unsupported output format '{file_type}', falling back to 'glb'")
+            file_type = 'glb'
+
         # Ensure save dir exists
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, f'{uid}.{file_type}')
-        
-        # Using tempfile first for safety
-        with tempfile.NamedTemporaryFile(suffix=f'.{file_type}', delete=True) as temp_file:
-            mesh.export(temp_file.name)
-            # Reload to flush and ensure validity
-            mesh = trimesh.load(temp_file.name)
-            mesh.export(save_path)
+
+        # Export directly. The previous code wrote to a NamedTemporaryFile
+        # with delete=True, then reloaded the mesh from a path that no longer
+        # existed (Windows-incompatible and a race on Linux). Re-exporting
+        # also loses metadata; we keep the original mesh object.
+        mesh.export(save_path)
 
         torch.cuda.empty_cache()
         return save_path

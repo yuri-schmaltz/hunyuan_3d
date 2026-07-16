@@ -33,34 +33,28 @@ export const SystemMonitor: React.FC = () => {
                 <Server size={16} className="text-archeon-primary" /> SYSTEM VITALS
             </h3>
 
-            {/* CPU */}
+            {/* CPU (process-level) */}
             <div className="space-y-1">
                 <div className="flex justify-between text-xs text-gray-300">
-                    <span className="flex items-center gap-1"><Cpu size={12} /> CPU</span>
+                    <span className="flex items-center gap-1"><Cpu size={12} /> CPU (proc)</span>
                     <span>{metrics.cpu_percent.toFixed(1)}%</span>
                 </div>
                 <div className="h-1.5 w-full bg-gray-800 rounded-full overflow-hidden">
                     <div
                         className="h-full bg-blue-500 transition-all duration-500 ease-out"
-                        style={{ width: `${metrics.cpu_percent}%` }}
+                        style={{ width: `${Math.min(100, metrics.cpu_percent)}%` }}
                     />
                 </div>
             </div>
 
-            {/* RAM */}
+            {/* RAM (process RSS) */}
             <div className="space-y-1">
                 <div className="flex justify-between text-xs text-gray-300">
-                    <span className="flex items-center gap-1"><CircuitBoard size={12} /> RAM</span>
-                    <span>{metrics.memory.percent.toFixed(1)}%</span>
-                </div>
-                <div className="h-1.5 w-full bg-gray-800 rounded-full overflow-hidden">
-                    <div
-                        className="h-full bg-purple-500 transition-all duration-500 ease-out"
-                        style={{ width: `${metrics.memory.percent}%` }}
-                    />
+                    <span className="flex items-center gap-1"><CircuitBoard size={12} /> RAM (proc)</span>
+                    <span>{metrics.rss_mb.toFixed(0)} MB</span>
                 </div>
                 <div className="text-[10px] text-gray-500 text-right">
-                    {(metrics.memory.used / 1024 / 1024 / 1024).toFixed(1)} GB / {(metrics.memory.total / 1024 / 1024 / 1024).toFixed(1)} GB
+                    VMS {metrics.vms_mb.toFixed(0)} MB &middot; uptime {Math.floor(metrics.uptime_seconds / 60)}m
                 </div>
             </div>
 
@@ -69,16 +63,20 @@ export const SystemMonitor: React.FC = () => {
                 <div className="space-y-1 pt-2 border-t border-gray-700/50">
                     <div className="flex justify-between text-xs text-gray-300">
                         <span className="flex items-center gap-1"><Activity size={12} /> VRAM ({metrics.gpu.name})</span>
-                        <span>{((metrics.gpu.used_memory / metrics.gpu.total_memory) * 100).toFixed(1)}%</span>
+                        <span>
+                            {((metrics.gpu.memory_allocated_mb / metrics.gpu.memory_total_mb) * 100).toFixed(1)}%
+                        </span>
                     </div>
                     <div className="h-1.5 w-full bg-gray-800 rounded-full overflow-hidden">
                         <div
                             className="h-full bg-green-500 transition-all duration-500 ease-out"
-                            style={{ width: `${(metrics.gpu.used_memory / metrics.gpu.total_memory) * 100}%` }}
+                            style={{
+                                width: `${Math.min(100, (metrics.gpu.memory_allocated_mb / metrics.gpu.memory_total_mb) * 100)}%`,
+                            }}
                         />
                     </div>
                     <div className="text-[10px] text-gray-500 text-right">
-                        {(metrics.gpu.used_memory / 1024).toFixed(1)} GB / {(metrics.gpu.total_memory / 1024).toFixed(1)} GB
+                        {metrics.gpu.memory_allocated_mb.toFixed(0)} MB allocated &middot; {metrics.gpu.memory_reserved_mb.toFixed(0)} MB reserved &middot; {metrics.gpu.memory_total_mb.toFixed(0)} MB total
                     </div>
                 </div>
             )}
