@@ -6,6 +6,7 @@ import { RefreshCw, CheckCircle, Clock, XCircle, AlertTriangle, Download, Scisso
 import { MeshPreview } from './MeshPreview';
 import { useJobEvents } from '../../context/useJobEvents';
 import { useJobStream } from '../../api/useJobStream';
+import { useJobListStream } from '../../api/useJobListStream';
 
 const POLL_INTERVAL_MS = 2000;
 // Cap the exponential backoff so a flapping backend doesn't degrade to multi-minute polls.
@@ -32,6 +33,24 @@ export const JobGallery: React.FC = () => {
         BASE_URL, previewingUid,
         { enabled: previewingUid !== null },
     );
+    const {
+        jobs: streamJobs,
+        connected: listConnected,
+        isFallback: listIsFallback,
+        refetch: refetchList,
+    } = useJobListStream(BASE_URL);
+    // Mirror the SSE list into local state. The server already sorts
+    // by created_at desc, but we re-sort to be defensive in case a
+    // caller hands us a different ordering.
+    useEffect(() => {
+        setJobs(
+            [...streamJobs].sort(
+                (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+            ),
+        );
+        setLoading(false);
+    }, [streamJobs]);
+
     const inFlight = useRef(false);
     // Exponential backoff state for polling after a failure.
     const consecutiveFailures = useRef(0);
@@ -95,18 +114,18 @@ export const JobGallery: React.FC = () => {
     useEffect(() => {
         if (submissionCount > lastSeenSubmission.current) {
             lastSeenSubmission.current = submissionCount;
-            void fetchJobs();
+            refetchList();
         }
     }, [submissionCount]);
 
     // Allow other components (e.g. CreateJobForm) to trigger an immediate refresh
     // through the JobEvents provider without prop-drilling.
-    useEffect(() => onJobSubmitted(() => { void fetchJobs(); }), [onJobSubmitted]);
+    useEffect(() => onJobSubmitted(() => { refetchList(); }), [onJobSubmitted, refetchList]);
 
     const handleCancel = async (uid: string) => {
         try {
             await apiClient.delete(`/jobs/${uid}`);
-            void fetchJobs();
+            refetchList();
         } catch (err) {
             console.error(err);
             setError(err instanceof Error ? err.message : 'Cancel failed');
@@ -168,12 +187,20 @@ export const JobGallery: React.FC = () => {
             <h3 className="text-lg font-semibold mb-4 text-gray-300 flex items-center justify-between sticky top-0 bg-archeon-panel py-2 z-10">
                 <span>Recent Jobs</span>
                 <button
-                    onClick={fetchJobs}
+                    onClick={() => refetchList()}
                     className="text-gray-500 hover:text-white"
                     aria-label="Refresh jobs"
                 >
                     <RefreshCw size={16} />
                 </button>
+                <span
+                    className="text-[10px] text-gray-500 ml-1"
+                    aria-live="polite"
+                    title={listIsFallback ? 'Live updates via polling' : 'Live updates via SSE'}
+                >
+                    <span className={`inline-block w-2 h-2 rounded-full mr-1 ${listConnected ? 'bg-emerald-500' : 'bg-gray-500'}`}></span>
+                    {listIsFallback ? 'polling' : listConnected ? 'live' : 'connecting'}
+                </span>
                 {previewingUid && (
                     <span
                         className="text-[10px] text-gray-500 ml-1"

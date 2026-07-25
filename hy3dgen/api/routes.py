@@ -42,6 +42,46 @@ async def list_jobs(
     """List all jobs in memory."""
     return list(manager.jobs.values())
 
+@router.get("/jobs/events")
+async def stream_jobs_events(
+    request: Request,
+    manager: PriorityRequestManager = Depends(get_manager),
+) -> EventSourceResponse:
+    """Server-Sent Events stream of the full job list.
+
+    The first event is the current snapshot (sorted by created_at desc),
+    so a client that connects after jobs have already been created
+    still gets the latest state. Subsequent events are full snapshots
+    whenever any job transitions, or when a job is added/evicted. The
+    stream stays open until the client disconnects.
+    """
+    queue = manager.subscribe_list()
+
+    async def list_publisher() -> AsyncIterator[Dict]:
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    jobs: List[JobResponse] = await asyncio.wait_for(
+                        queue.get(), timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    # Keep-alive ping so proxies don't time out the connection.
+                    yield {"event": "ping", "data": "{}"}
+                    continue
+                # Each event payload is a JSON array of JobResponse dicts.
+                payload = json.dumps(
+                    [j.model_dump(mode="json") for j in jobs],
+                    default=str,
+                )
+                yield {"event": "list", "data": payload}
+        finally:
+            manager.unsubscribe_list(queue)
+
+    return EventSourceResponse(list_publisher())
+
+
 @router.get("/jobs/{uid}", response_model=JobResponse)
 async def get_job_status(
     uid: str,
