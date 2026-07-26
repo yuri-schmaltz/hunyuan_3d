@@ -45,7 +45,7 @@ class TestSubscribeNotify:
         mgr.jobs["a"] = JobResponse(uid="a", status=JobStatus.QUEUED, created_at="2025-01-01T00:00:00")
 
         async def _scenario():
-            queue = mgr.subscribe("a")
+            queue = await mgr.subscribe("a")
             item = await asyncio.wait_for(queue.get(), timeout=1.0)
             return item
 
@@ -59,8 +59,8 @@ class TestSubscribeNotify:
         mgr.jobs["a"] = JobResponse(uid="a", status=JobStatus.QUEUED, created_at="2025-01-01T00:00:00")
 
         async def _scenario():
-            q1 = mgr.subscribe("a")
-            q2 = mgr.subscribe("a")
+            q1 = await mgr.subscribe("a")
+            q2 = await mgr.subscribe("a")
             # Drain the initial prime events.
             await asyncio.wait_for(q1.get(), timeout=1.0)
             await asyncio.wait_for(q2.get(), timeout=1.0)
@@ -81,7 +81,7 @@ class TestSubscribeNotify:
         mgr.jobs["a"] = JobResponse(uid="a", status=JobStatus.QUEUED, created_at="2025-01-01T00:00:00")
 
         async def _scenario():
-            q = mgr.subscribe("a")
+            q = await mgr.subscribe("a")
             await asyncio.wait_for(q.get(), timeout=1.0)  # drain initial
             mgr.unsubscribe("a", q)
             mgr._notify(mgr.jobs["a"])
@@ -93,7 +93,7 @@ class TestSubscribeNotify:
 
         assert asyncio.run(_scenario()) is True
 
-    def test_persistence_called_on_transitions(self, tmp_path):
+    async def test_persistence_called_on_transitions(self, tmp_path):
         """Each status transition should mirror to the store."""
         from hy3dgen.api.persistence import JobStore
         store = JobStore(str(tmp_path / "jobs.db"))
@@ -103,13 +103,13 @@ class TestSubscribeNotify:
 
         # Simulate the worker code path: PROCESSING then COMPLETED.
         mgr.jobs["a"].status = JobStatus.PROCESSING
-        mgr._persist(mgr.jobs["a"])
+        await mgr._persist(mgr.jobs["a"])
         mgr.jobs["a"].status = JobStatus.COMPLETED
         mgr.jobs["a"].file_path = "/tmp/fake.glb"
         mgr.jobs["a"].completed_at = "2025-01-01T00:00:01"
-        mgr._persist(mgr.jobs["a"])
+        await mgr._persist(mgr.jobs["a"])
 
-        loaded = store.get("a")
+        loaded = await store.get("a")
         assert loaded is not None
         assert loaded.status == JobStatus.COMPLETED
         assert loaded.file_path == "/tmp/fake.glb"

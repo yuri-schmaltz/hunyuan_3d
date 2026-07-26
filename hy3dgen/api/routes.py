@@ -178,10 +178,12 @@ async def stream_job_events(
     is sent, or when the client disconnects.
     """
     # 404 if the uid is unknown.
-    if manager.get_job(uid) is None and (
-        manager.store is None or manager.store.get(uid) is None
-    ):
-        raise HTTPException(status_code=404, detail="Job not found")
+    if manager.get_job(uid) is None:
+        if manager.store is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        stored = await manager.store.get(uid)
+        if stored is None:
+            raise HTTPException(status_code=404, detail="Job not found")
 
     queue = manager.subscribe(uid)
 
@@ -212,6 +214,34 @@ async def stream_job_events(
 # ---------------------------------------------------------------------------
 # System + post-processing
 # ---------------------------------------------------------------------------
+
+@router.get(
+    "/admin/stats",
+    tags=["admin"],
+    summary="Operational stats (job counts per status, model + queue state)",
+)
+async def admin_stats(manager: ManagerDep) -> dict:
+    """Counts of jobs by status, plus the queue depth and persistence state.
+
+    Useful for dashboards and health checks that want more detail
+    than ``/health``. Auth-gated like every other ``/v1/*`` route.
+    """
+    jobs_in_memory = len(manager.jobs)
+    counts_by_status: dict[str, int] = {}
+    for j in manager.jobs.values():
+        key = j.status.value if hasattr(j.status, "value") else str(j.status)
+        counts_by_status[key] = counts_by_status.get(key, 0) + 1
+    jobs_in_store = (await manager.store.count()) if manager.store is not None else 0
+    return {
+        "queue_depth": manager.queue.qsize(),
+        "jobs_in_memory": jobs_in_memory,
+        "jobs_in_store": jobs_in_store,
+        "by_status": counts_by_status,
+        "persistence_enabled": manager.store is not None,
+        "model_loaded": manager.worker is not None,
+        "max_history": manager.max_history,
+    }
+
 
 @router.get("/system/metrics", tags=["system"], summary="CPU/GPU/RAM usage")
 async def get_metrics() -> dict:

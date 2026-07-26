@@ -106,7 +106,7 @@ async def health_check():
     last_error = getattr(manager, "last_error", None) if manager is not None else None
     store = getattr(manager, "store", None) if manager is not None else None
     jobs_in_memory = len(manager.jobs) if manager is not None else 0
-    jobs_in_store = store.count() if store is not None else 0
+    jobs_in_store = (await store.count()) if store is not None else 0
     started = getattr(app.state, "started_at", None)
     if started is None:
         started = time.monotonic()

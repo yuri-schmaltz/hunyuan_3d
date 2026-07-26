@@ -40,7 +40,7 @@ def _seed_job(m: PriorityRequestManager, uid: str, status: JobStatus) -> None:
 
 
 class TestSubscribeList:
-    def test_subscribe_list_primes_with_current_jobs(self):
+    async def test_subscribe_list_primes_with_current_jobs(self):
         m = _new_manager()
         _seed_job(m, "a", JobStatus.QUEUED)
         _seed_job(m, "b", JobStatus.COMPLETED)
@@ -50,7 +50,7 @@ class TestSubscribeList:
         assert uids == ["a", "b"]  # both jobs are in the snapshot
         m.unsubscribe_list(q)
 
-    def test_notify_list_fans_out_to_all_subscribers(self):
+    async def test_notify_list_fans_out_to_all_subscribers(self):
         m = _new_manager()
         q1 = m.subscribe_list()
         q1.get_nowait()  # drain priming
@@ -65,7 +65,7 @@ class TestSubscribeList:
         m.unsubscribe_list(q1)
         m.unsubscribe_list(q2)
 
-    def test_notify_via_job_transition_reaches_list_subscribers(self):
+    async def test_notify_via_job_transition_reaches_list_subscribers(self):
         m = _new_manager()
         q = m.subscribe_list()
         q.get_nowait()
@@ -76,7 +76,7 @@ class TestSubscribeList:
         assert any(j.uid == "y" for j in snap)
         m.unsubscribe_list(q)
 
-    def test_unsubscribe_list_stops_events(self):
+    async def test_unsubscribe_list_stops_events(self):
         m = _new_manager()
         q = m.subscribe_list()
         q.get_nowait()
@@ -86,14 +86,14 @@ class TestSubscribeList:
         m._notify(m.jobs["z"])
         # Confirm no event arrived within a small window.
         try:
-            asyncio.run(asyncio.wait_for(q.get(), timeout=0.05))
+            await asyncio.wait_for(q.get(), timeout=0.05)
             raise AssertionError("expected no event after unsubscribe")
         except asyncio.TimeoutError:
             pass  # good — no event arrived
 
 
 class TestListNotifyOnEvict:
-    def test_evict_old_jobs_notifies_list_subscribers(self):
+    async def test_evict_old_jobs_notifies_list_subscribers(self):
         m = _new_manager()
         m.max_history = 0  # disable size-based eviction path
         _seed_job(m, "old", JobStatus.COMPLETED)
@@ -101,7 +101,7 @@ class TestListNotifyOnEvict:
         m.jobs["old"].created_at = "1990-01-01T00:00:00"
         q = m.subscribe_list()
         q.get_nowait()  # priming
-        m.evict_old_jobs(max_age_seconds=60)
+        await m.evict_old_jobs(max_age_seconds=60)
         # After eviction the next event should be a fresh snapshot
         # that no longer contains "old".
         snap = q.get_nowait()

@@ -76,7 +76,7 @@ class PriorityRequestManager:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def rehydrate(self) -> int:
+    async def rehydrate(self) -> int:
         """Restore jobs from the persistent store into memory.
 
         Returns the number of jobs rehydrated. Active jobs (queued or
@@ -92,7 +92,7 @@ class PriorityRequestManager:
         from hy3dgen.api.config import SAVE_DIR
         count = 0
         replayed = 0
-        for job, payload in self.store.restore_all():
+        async for job, payload in self.store.restore_all():
             self.jobs[job.uid] = job
             count += 1
             if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
@@ -107,7 +107,7 @@ class PriorityRequestManager:
                     "Please resubmit."
                 )
                 job.completed_at = datetime.utcnow().isoformat()
-                self._persist(job)
+                await self._persist(job)
                 self._notify(job)
                 logger.warning(f"Cannot replay job {job.uid}: payload missing.")
                 continue
@@ -117,7 +117,7 @@ class PriorityRequestManager:
                 job.status = JobStatus.FAILED
                 job.error = f"Stored payload could not be deserialized: {e}"
                 job.completed_at = datetime.utcnow().isoformat()
-                self._persist(job)
+                await self._persist(job)
                 self._notify(job)
                 logger.warning(f"Cannot replay job {job.uid}: bad payload ({e}).")
                 continue
@@ -135,7 +135,7 @@ class PriorityRequestManager:
     async def start(self):
         """Start the background worker loop."""
         if self._worker_task is None:
-            self.rehydrate()
+            await self.rehydrate()
             self._worker_task = asyncio.create_task(self._process_queue())
             logger.info("PriorityRequestManager worker started.")
 
@@ -182,7 +182,7 @@ class PriorityRequestManager:
         await self.queue.put((priority, time.time(), uid, request, save_dir))
         logger.info(f"Job {uid} queued with priority {priority}")
         # Persist the initial state and notify any early subscribers.
-        self._persist(job, payload=_payload or (request.model_dump() if request else None))
+        await self._persist(job, payload=_payload or (request.model_dump() if request else None))
         self._notify(job)
         return uid
 
@@ -213,7 +213,7 @@ class PriorityRequestManager:
     def get_job(self, uid: str) -> JobResponse | None:
         return self.jobs.get(uid)
 
-    def evict_old_jobs(self, max_age_seconds: int = 24 * 3600) -> int:
+    async def evict_old_jobs(self, max_age_seconds: int = 24 * 3600) -> int:
         """Drop completed/failed/cancelled jobs older than ``max_age_seconds``.
 
         Active (queued/processing) jobs are never evicted. Returns the number
@@ -242,13 +242,13 @@ class PriorityRequestManager:
             del self.jobs[uid]
             self._evicted_total += 1
             if self.store is not None:
-                self.store.delete(uid)
+                await self.store.delete(uid)
         if victims:
             logger.info(f"Evicted {len(victims)} old jobs (older than {max_age_seconds}s).")
             self._notify_list()
         return len(victims)
 
-    def evict_to_size(self) -> int:
+    async def evict_to_size(self) -> int:
         """If ``max_history`` is set and exceeded, drop the oldest terminal jobs.
 
         Returns the number evicted.
@@ -274,13 +274,13 @@ class PriorityRequestManager:
             del self.jobs[uid]
             self._evicted_total += 1
             if self.store is not None:
-                self.store.delete(uid)
+                await self.store.delete(uid)
         if to_remove > 0:
             logger.info(f"Evicted {to_remove} jobs to respect max_history={self.max_history}.")
             self._notify_list()
         return to_remove
 
-    def cancel_job(self, uid: str) -> None:
+    async def cancel_job(self, uid: str) -> None:
         # We can only cancel jobs that are still in the queue.
         job = self.jobs.get(uid)
         if job is None or job.status != JobStatus.QUEUED:
@@ -288,7 +288,7 @@ class PriorityRequestManager:
         job.status = JobStatus.CANCELLED
         job.error = "Cancelled by user"
         logger.info(f"Job {uid} cancelled")
-        self._persist(job)
+        await self._persist(job)
         self._notify(job)
 
     async def _process_queue(self):
@@ -318,7 +318,7 @@ class PriorityRequestManager:
     async def _execute_model_worker(self, uid: str, request: JobRequest, save_dir: str):
         job = self.jobs[uid]
         job.status = JobStatus.PROCESSING
-        self._persist(job)
+        await self._persist(job)
         self._notify(job)
         span = start_span(
             "archeon.job.execute",
@@ -390,7 +390,7 @@ class PriorityRequestManager:
                 except ValueError:
                     pass
             end_span(span)
-            self._persist(job)
+            await self._persist(job)
             self._notify(job)
 
         except Exception as e:
@@ -404,7 +404,7 @@ class PriorityRequestManager:
             self.last_error = f"{type(e).__name__}: {e}"
             JOBS_FAILED.labels(reason=type(e).__name__).inc()
             end_span(span, error=e)
-            self._persist(job)
+            await self._persist(job)
             self._notify(job)
 
     def _aggressive_cleanup(self):
@@ -422,12 +422,12 @@ class PriorityRequestManager:
     # Persistence + pub/sub
     # ------------------------------------------------------------------
 
-    def _persist(self, job: JobResponse, payload: dict | None = None) -> None:
+    async def _persist(self, job: JobResponse, payload: dict | None = None) -> None:
         """Mirror a job transition to the persistent store. No-op without one."""
         if self.store is None:
             return
         try:
-            self.store.upsert(job, request_payload=payload)
+            await self.store.upsert(job, request_payload=payload)
         except Exception as e:  # never let persistence failures kill the worker
             logger.warning(f"Failed to persist job {job.uid}: {e}")
 
@@ -468,7 +468,7 @@ class PriorityRequestManager:
             except asyncio.QueueFull:  # pragma: no cover (unbounded queue)
                 logger.warning("List subscriber queue full; dropping event")
 
-    def subscribe(self, uid: str) -> asyncio.Queue:
+    async def subscribe(self, uid: str) -> asyncio.Queue:
         """Register a new subscriber for ``uid`` and return its queue.
 
         The caller is expected to read the queue and call
@@ -481,7 +481,9 @@ class PriorityRequestManager:
             self._subscribers.setdefault(uid, []).append(q)
         # Prime the queue with the current state so the consumer has it
         # immediately, even if no further transitions happen.
-        current = self.jobs.get(uid) or (self.store.get(uid) if self.store else None)
+        current = self.jobs.get(uid)
+        if current is None and self.store is not None:
+            current = await self.store.get(uid)
         if current is not None:
             q.put_nowait(current)
         return q
