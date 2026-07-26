@@ -61,6 +61,12 @@ jobs:
           python -m mypy --follow-imports=silent \
               --explicit-package-bases hy3dgen hy3dgen/api hy3dgen/cli.py
 
+      - name: ruff
+        run: |
+          pip install ruff
+          ruff check hy3dgen tests
+          ruff format --check hy3dgen tests
+
   # ---------------------------------------------------------------------------
   # Frontend: tsc + eslint + build
   # ---------------------------------------------------------------------------

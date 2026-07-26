@@ -101,7 +101,17 @@ test: ## Run the full pytest suite.
 		--ignore=tests/test_imports.py
 
 .PHONY: lint
-lint: mypy tsc eslint ## Run all linters (mypy + tsc + eslint).
+lint: ruff mypy tsc eslint ## Run all linters (ruff + mypy + tsc + eslint).
+
+.PHONY: ruff
+ruff: ## Run ruff (fast linter + formatter check).
+	ruff check hy3dgen tests
+	ruff format --check hy3dgen tests
+
+.PHONY: ruff-fix
+ruff-fix: ## Auto-fix what ruff can.
+	ruff check hy3dgen tests --fix
+	ruff format hy3dgen tests
 
 .PHONY: mypy
 mypy: ## Type-check the Python package.

@@ -1,17 +1,26 @@
 import asyncio
+import contextlib
 import gc
 import logging
 import threading
-import torch
-import uuid
-import os
 import time
+import uuid
 from datetime import datetime
-from typing import Dict, Optional, Tuple, Any
 
-from hy3dgen.inference import ModelWorker
+import torch
+
+from hy3dgen.api.metrics import (
+    JOB_DURATION,
+    JOBS_COMPLETED,
+    JOBS_FAILED,
+    JOBS_IN_MEMORY,
+    JOBS_SUBMITTED,
+    end_span,
+    start_span,
+)
 from hy3dgen.api.persistence import JobStore
-from hy3dgen.api.schemas import JobStatus, JobResponse, JobRequest, GenerationRequest
+from hy3dgen.api.schemas import GenerationRequest, JobRequest, JobResponse, JobStatus
+from hy3dgen.inference import ModelWorker
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +36,13 @@ class PriorityRequestManager:
         device='cuda',
         max_concurrent=1,
         max_history: int = 1000,
-        store: Optional[JobStore] = None,
+        store: JobStore | None = None,
     ):
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
-        self.jobs: Dict[str, JobResponse] = {}
+        self.jobs: dict[str, JobResponse] = {}
         self.device = device
         self._shutdown_event = asyncio.Event()
-        self._worker_task: Optional[asyncio.Task] = None
+        self._worker_task: asyncio.Task | None = None
 
         # Cap the in-memory job history so a long-running server doesn't grow
         # unbounded. Old completed/failed/cancelled jobs are evicted when the
@@ -43,16 +52,16 @@ class PriorityRequestManager:
 
         # Most recent worker error (string) so /health can surface it.
         # Cleared automatically on the next successful job.
-        self.last_error: Optional[str] = None
+        self.last_error: str | None = None
 
         # Optional SQLite-backed persistence. When set, every job transition
         # is mirrored to disk and the in-memory state is rehydrated on start.
-        self.store: Optional[JobStore] = store
+        self.store: JobStore | None = store
 
         # Per-job subscribers. ``subscribers[uid]`` is a list of asyncio
         # Queues; on each status change we put the new JobResponse on every
         # queue. SSE handlers consume one queue each.
-        self._subscribers: Dict[str, list[asyncio.Queue]] = {}
+        self._subscribers: dict[str, list[asyncio.Queue]] = {}
         self._subs_lock = threading.Lock()
         # List-level subscribers (one queue per consumer). On every job
         # change we broadcast the current full list to all of these.
@@ -61,7 +70,7 @@ class PriorityRequestManager:
         self._list_subs_lock = threading.Lock()
 
         # Lazy initialization of the worker to speed up startup
-        self.worker: Optional[ModelWorker] = None
+        self.worker: ModelWorker | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -135,10 +144,8 @@ class PriorityRequestManager:
         self._shutdown_event.set()
         if self._worker_task:
             self._worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._worker_task
-            except asyncio.CancelledError:
-                pass
         logger.info("PriorityRequestManager worker stopped.")
 
     async def submit_job(
@@ -146,7 +153,7 @@ class PriorityRequestManager:
         request: JobRequest,
         save_dir: str,
         priority: int = 10,
-        _payload: Optional[dict] = None,
+        _payload: dict | None = None,
     ) -> str:
         """Submit a job to the queue.
 
@@ -193,14 +200,17 @@ class PriorityRequestManager:
         """
         internal = request.to_internal_request()
         unified_payload = request.model_dump(mode="json", exclude_none=True)
-        return await self.submit_job(
+        uid = await self.submit_job(
             request=internal,
             save_dir=save_dir,
             priority=priority,
             _payload=unified_payload,
         )
+        JOBS_SUBMITTED.labels(mode=internal.type).inc()
+        JOBS_IN_MEMORY.set(len(self.jobs))
+        return uid
 
-    def get_job(self, uid: str) -> Optional[JobResponse]:
+    def get_job(self, uid: str) -> JobResponse | None:
         return self.jobs.get(uid)
 
     def evict_old_jobs(self, max_age_seconds: int = 24 * 3600) -> int:
@@ -270,22 +280,23 @@ class PriorityRequestManager:
             self._notify_list()
         return to_remove
 
-    def cancel_job(self, uid: str):
-        if uid in self.jobs:
-            # We can only cancel if it's not yet processing (or barely started)
-            if self.jobs[uid].status == JobStatus.QUEUED:
-                self.jobs[uid].status = JobStatus.CANCELLED
-                self.jobs[uid].error = "Cancelled by user"
-                logger.info(f"Job {uid} cancelled")
-                self._persist(self.jobs[uid])
-                self._notify(self.jobs[uid])
+    def cancel_job(self, uid: str) -> None:
+        # We can only cancel jobs that are still in the queue.
+        job = self.jobs.get(uid)
+        if job is None or job.status != JobStatus.QUEUED:
+            return
+        job.status = JobStatus.CANCELLED
+        job.error = "Cancelled by user"
+        logger.info(f"Job {uid} cancelled")
+        self._persist(job)
+        self._notify(job)
 
     async def _process_queue(self):
         while not self._shutdown_event.is_set():
             try:
                 # Wait for job
-                priority, _, uid, request, save_dir = await self.queue.get()
-                
+                _, _, uid, request, save_dir = await self.queue.get()
+
                 # Check status
                 if uid not in self.jobs or self.jobs[uid].status in (JobStatus.CANCELLED, JobStatus.FAILED):
                     self.queue.task_done()
@@ -293,7 +304,7 @@ class PriorityRequestManager:
 
                 # Run job
                 await self._execute_model_worker(uid, request, save_dir)
-                
+
                 # Cleanup
                 self.queue.task_done()
                 self._aggressive_cleanup()
@@ -309,6 +320,10 @@ class PriorityRequestManager:
         job.status = JobStatus.PROCESSING
         self._persist(job)
         self._notify(job)
+        span = start_span(
+            "archeon.job.execute",
+            **{"job.uid": uid, "job.mode": getattr(request, "type", "unknown")},
+        )
 
         try:
             # Validate texture_mesh has a reference (image or prompt) before
@@ -367,6 +382,14 @@ class PriorityRequestManager:
             logger.info(f"Job {uid} completed successfully")
             # Clear the last_error latch after a success.
             self.last_error = None
+            JOBS_COMPLETED.inc()
+            if job.created_at:
+                try:
+                    start_ts = datetime.fromisoformat(job.created_at).timestamp()
+                    JOB_DURATION.observe(time.time() - start_ts)
+                except ValueError:
+                    pass
+            end_span(span)
             self._persist(job)
             self._notify(job)
 
@@ -379,6 +402,8 @@ class PriorityRequestManager:
             job.completed_at = datetime.utcnow().isoformat()
             # Track the most recent failure so /health can surface it.
             self.last_error = f"{type(e).__name__}: {e}"
+            JOBS_FAILED.labels(reason=type(e).__name__).inc()
+            end_span(span, error=e)
             self._persist(job)
             self._notify(job)
 
@@ -397,7 +422,7 @@ class PriorityRequestManager:
     # Persistence + pub/sub
     # ------------------------------------------------------------------
 
-    def _persist(self, job: JobResponse, payload: Optional[dict] = None) -> None:
+    def _persist(self, job: JobResponse, payload: dict | None = None) -> None:
         """Mirror a job transition to the persistent store. No-op without one."""
         if self.store is None:
             return
@@ -466,10 +491,8 @@ class PriorityRequestManager:
             listeners = self._subscribers.get(uid)
             if not listeners:
                 return
-            try:
+            with contextlib.suppress(ValueError):
                 listeners.remove(queue)
-            except ValueError:
-                pass
             if not listeners:
                 self._subscribers.pop(uid, None)
 
@@ -495,11 +518,8 @@ class PriorityRequestManager:
         return q
 
     def unsubscribe_list(self, queue: asyncio.Queue) -> None:
-        with self._list_subs_lock:
-            try:
-                self._list_subscribers.remove(queue)
-            except ValueError:
-                pass
+        with self._list_subs_lock, contextlib.suppress(ValueError):
+            self._list_subscribers.remove(queue)
 
 
 # ---------------------------------------------------------------------------
@@ -531,11 +551,11 @@ def _request_from_payload(payload: dict):
     - **Legacy** (pre #7): has a ``type`` field. Dispatched by tag.
     """
     from hy3dgen.api.schemas import (
-        TextTo3DRequest,
+        GenerationRequest,
         ImageTo3DRequest,
         MultiviewRequest,
+        TextTo3DRequest,
         TextureMeshRequest,
-        GenerationRequest,
     )
     if _REQUEST_CLASSES["text_to_3d"] is None:
         _REQUEST_CLASSES.update({

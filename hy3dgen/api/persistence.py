@@ -27,12 +27,11 @@ import json
 import os
 import sqlite3
 import threading
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Optional
 
 from hy3dgen.api.schemas import JobResponse, JobStatus
-
 
 _DEFAULT_DB_PATH = os.path.join(
     os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
@@ -65,7 +64,7 @@ class JobStore:
     readers can run concurrently without locking each other out.
     """
 
-    def __init__(self, db_path: Optional[str] = None) -> None:
+    def __init__(self, db_path: str | None = None) -> None:
         self._db_path = db_path or _DEFAULT_DB_PATH
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         # Open one connection for schema setup; subsequent calls open
@@ -86,7 +85,7 @@ class JobStore:
 
     # -- public API ------------------------------------------------------
 
-    def upsert(self, job: JobResponse, request_payload: Optional[dict] = None) -> None:
+    def upsert(self, job: JobResponse, request_payload: dict | None = None) -> None:
         """Insert or update a job row. Safe to call from any thread."""
         blob = json.dumps(request_payload) if request_payload is not None else None
         with self._lock, self._connect() as conn:
@@ -113,15 +112,15 @@ class JobStore:
                 ),
             )
 
-    def get(self, uid: str) -> Optional[JobResponse]:
+    def get(self, uid: str) -> JobResponse | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE uid = ?", (uid,)).fetchone()
         return _row_to_job(row) if row else None
 
     def list(
         self,
-        status: Optional[JobStatus] = None,
-        limit: Optional[int] = None,
+        status: JobStatus | None = None,
+        limit: int | None = None,
     ) -> list[JobResponse]:
         clauses: list[str] = []
         params: list = []
@@ -165,7 +164,7 @@ class JobStore:
             row = conn.execute("SELECT COUNT(*) AS c FROM jobs").fetchone()
         return int(row["c"]) if row else 0
 
-    def restore_all(self) -> Iterable[tuple[JobResponse, Optional[dict]]]:
+    def restore_all(self) -> Iterable[tuple[JobResponse, dict | None]]:
         """Yield (job, request_payload) for every persisted job, oldest first.
 
         The manager calls this on startup to rehydrate the in-memory

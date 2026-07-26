@@ -13,7 +13,7 @@ Usage:
 
 import logging
 import re
-from importlib.metadata import version as pkg_version, PackageNotFoundError
+from importlib.metadata import PackageNotFoundError, version as pkg_version
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +47,8 @@ def check_for_updates(timeout: float = 3.0) -> dict | None:
     otherwise returns None. Never raises — failures are logged as warnings.
     """
     try:
-        import urllib.request
         import json
+        import urllib.request
 
         current = get_current_version()
         req = urllib.request.Request(

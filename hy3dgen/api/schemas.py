@@ -1,6 +1,8 @@
 from enum import Enum
-from typing import Optional, Literal, Union, Annotated
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 
 class JobStatus(str, Enum):
     QUEUED = "queued"
@@ -72,10 +74,10 @@ class TextureMeshRequest(BaseGenerationRequest):
     """
     type: Literal['texture_mesh'] = 'texture_mesh'
     mesh: str = Field(..., description="Base64-encoded GLB of the mesh to re-texture")
-    image: Optional[str] = Field(
+    image: str | None = Field(
         None, description="Optional base64 image used as the texture reference"
     )
-    prompt: Optional[str] = Field(
+    prompt: str | None = Field(
         None, min_length=1, description="Optional text prompt used as the texture reference"
     )
 
@@ -86,7 +88,7 @@ class TextureMeshRequest(BaseGenerationRequest):
 
 # Discriminated Union for polymorphic handling
 JobRequest = Annotated[
-    Union[TextTo3DRequest, ImageTo3DRequest, MultiviewRequest, TextureMeshRequest],
+    TextTo3DRequest | ImageTo3DRequest | MultiviewRequest | TextureMeshRequest,
     Field(discriminator='type'),
 ]
 
@@ -95,10 +97,10 @@ class JobResponse(BaseModel):
     uid: str
     status: JobStatus
     created_at: str
-    completed_at: Optional[str] = None
-    error: Optional[str] = None
-    file_path: Optional[str] = None
-    
+    completed_at: str | None = None
+    error: str | None = None
+    file_path: str | None = None
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -151,17 +153,17 @@ class GenerationRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     # --- Inputs (any combination, validated below) -------------------
-    text: Optional[str] = Field(
+    text: str | None = Field(
         None, description="Text prompt or guidance. Required for text_to_3d.",
         examples=["a small red cube"],
     )
-    image: Optional[str] = Field(
+    image: str | None = Field(
         None, description="Base64-encoded image (single view, used by image_to_3d).",
     )
-    views: Optional[_MultiviewViews] = Field(
+    views: _MultiviewViews | None = Field(
         None, description="Four base64-encoded views (front/back/left/right).",
     )
-    mesh: Optional[str] = Field(
+    mesh: str | None = Field(
         None, description="Base64-encoded GLB to re-texture (texture_mesh).",
     )
 
@@ -235,7 +237,7 @@ class GenerationRequest(BaseModel):
         inferred mode. The manager dispatches based on the resulting
         ``type`` discriminator.
         """
-        from typing import cast, Any
+        from typing import Any, cast
         common = cast("dict[str, Any]", {
             "seed": self.seed,
             "steps": self.steps,

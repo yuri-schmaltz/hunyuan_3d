@@ -1,0 +1,32 @@
+# Pre-commit hooks for the Archeon project.
+# Install: `pip install pre-commit && pre-commit install`
+# Run manually: `pre-commit run --all-files`
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.0
+    hooks:
+      - id: ruff
+        args: ["--fix", "--exit-non-zero-on-fix"]
+      - id: ruff-format
+        files: ^(hy3dgen|tests|launcher|blender_addon)\.py$
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        # mypy is slow; only run on push, not on every commit.
+        stages: [manual]
+        files: ^(hy3dgen|launcher|blender_addon)\.py$
+        args: ["--follow-imports=silent", "--explicit-package-bases"]

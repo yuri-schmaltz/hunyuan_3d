@@ -45,6 +45,9 @@ dependencies = [
     "numpy",
     "requests",
     "python-multipart>=0.0.9",
+    "slowapi>=0.1.9",
+    "prometheus-client>=0.20",
+    "pydantic-settings>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -105,7 +108,13 @@ follow_imports = "silent"
 explicit_package_bases = true
 ignore_missing_imports = true
 warn_unused_ignores = true
+warn_return_any = true
+warn_redundant_casts = true
+warn_incomplete_stub = true
+no_implicit_optional = true
+check_untyped_defs = true
 disallow_untyped_defs = false
+disallow_incomplete_defs = false
 exclude = [
     "build/",
     "dist/",
@@ -113,6 +122,74 @@ exclude = [
     "tests/",
     "examples/",
 ]
+
+[[tool.mypy.overrides]]
+module = [
+    "hy3dgen.shapegen",
+    "hy3dgen.texgen",
+    "hy3dgen.rembg",
+    "hy3dgen.text2image",
+    "hy3dgen.version",
+    "hy3dgen.monitoring",
+    "hy3dgen.inference",
+    "hy3dgen.meshops",
+    "launcher",
+    "blender_addon",
+]
+ignore_errors = true
+
+# ---------------------------------------------------------------------------
+# Ruff — fast linter + formatter (replaces flake8/isort/pyupgrade/...)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    "build",
+    "dist",
+    ".venv",
+    "archeon_frontend",
+    "examples",
+    "tests/fixtures",
+]
+
+[tool.ruff.lint]
+# Strict-ish defaults. Add rules rather than removing them.
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "UP",     # pyupgrade (catches the Optional[X] -> X | None refactor)
+    "SIM",    # flake8-simplify
+    "C4",     # flake8-comprehensions
+    "RUF",    # ruff-specific
+    "N",      # pep8-naming
+    "ASYNC",  # flake8-async
+    "TID",    # flake8-tidy-imports
+]
+ignore = [
+    "E501",   # line length is handled by formatter
+    "B008",   # FastAPI's Depends() in defaults is intentional
+    "SIM108", # sometimes ternary hurts readability
+    "N818",   # exception name suffix — has false positives
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "N802", "N803"]  # asserts + mock names are fine in tests
+"examples/*" = ["B", "N"]              # examples can be sloppy
+"launcher.py" = ["B", "N", "E", "W", "F"]  # upstream code, leave alone
+"blender_addon.py" = ["B", "N", "E", "W", "F"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["hy3dgen"]
+combine-as-imports = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
