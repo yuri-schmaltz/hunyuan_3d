@@ -11,7 +11,7 @@ from typing import Dict, Optional, Tuple, Any
 
 from hy3dgen.inference import ModelWorker
 from hy3dgen.api.persistence import JobStore
-from hy3dgen.api.schemas import JobStatus, JobResponse, JobRequest
+from hy3dgen.api.schemas import JobStatus, JobResponse, JobRequest, GenerationRequest
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +178,27 @@ class PriorityRequestManager:
         self._persist(job, payload=_payload or (request.model_dump() if request else None))
         self._notify(job)
         return uid
+
+    async def submit_unified(
+        self,
+        request: GenerationRequest,
+        save_dir: str,
+        priority: int = 10,
+    ) -> str:
+        """Submit a job from the unified ``GenerationRequest`` schema.
+
+        The request is converted to the internal ``JobRequest`` variant
+        for dispatch, but the unified form is what we persist (so a
+        restart can reconstruct the exact API surface the user sent).
+        """
+        internal = request.to_internal_request()
+        unified_payload = request.model_dump(mode="json", exclude_none=True)
+        return await self.submit_job(
+            request=internal,
+            save_dir=save_dir,
+            priority=priority,
+            _payload=unified_payload,
+        )
 
     def get_job(self, uid: str) -> Optional[JobResponse]:
         return self.jobs.get(uid)
@@ -503,12 +524,18 @@ def _request_from_payload(payload: dict):
 
     Used by ``PriorityRequestManager.rehydrate`` to rebuild the original
     request from a payload we stored in SQLite.
+
+    Two shapes are supported:
+    - **Unified** (post #7): no ``type`` field, has ``text``/``image``/
+      ``views``/``mesh``. Converted via ``GenerationRequest.to_internal_request()``.
+    - **Legacy** (pre #7): has a ``type`` field. Dispatched by tag.
     """
     from hy3dgen.api.schemas import (
         TextTo3DRequest,
         ImageTo3DRequest,
         MultiviewRequest,
         TextureMeshRequest,
+        GenerationRequest,
     )
     if _REQUEST_CLASSES["text_to_3d"] is None:
         _REQUEST_CLASSES.update({
@@ -519,6 +546,13 @@ def _request_from_payload(payload: dict):
         })
     if not isinstance(payload, dict):
         raise ValueError(f"Payload is not a dict: {type(payload).__name__}")
+
+    # Unified form: no ``type`` tag, just inputs + common params.
+    if "type" not in payload:
+        unified = GenerationRequest.model_validate(payload)
+        return unified.to_internal_request()
+
+    # Legacy form: dispatch by ``type``.
     tag = payload.get("type")
     if tag not in _REQUEST_CLASSES:
         raise ValueError(f"Unknown request type: {tag!r}")

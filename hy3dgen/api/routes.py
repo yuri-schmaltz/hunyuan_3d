@@ -5,7 +5,12 @@ import asyncio
 import json
 from typing import List, Dict, AsyncIterator
 from sse_starlette.sse import EventSourceResponse
-from hy3dgen.api.schemas import JobRequest, JobResponse, MeshOpsRequest
+from hy3dgen.api.schemas import (
+    JobRequest,
+    JobResponse,
+    MeshOpsRequest,
+    GenerationRequest,
+)
 from hy3dgen.api.deps import get_manager, get_mesh_processor
 from hy3dgen.api.manager import PriorityRequestManager
 from hy3dgen.meshops.processor import MeshProcessor
@@ -34,6 +39,23 @@ async def submit_job(
     # Return initial status
     job = manager.get_job(uid)
     return job
+
+
+@router.post("/generate", response_model=JobResponse, status_code=202)
+async def submit_unified_job(
+    request: GenerationRequest,
+    manager: PriorityRequestManager = Depends(get_manager),
+):
+    """Submit a generation job using the unified request schema.
+
+    All input fields are optional at the type level; the backend infers
+    the generation mode from what's filled in. See ``GenerationRequest``
+    for the dispatch rules. The internal ``JobRequest`` variant is
+    derived automatically and dispatched the same way as a job
+    submitted via ``POST /v1/jobs``.
+    """
+    uid = await manager.submit_unified(request, SAVE_DIR)
+    return manager.get_job(uid)
 
 @router.get("/jobs", response_model=List[JobResponse])
 async def list_jobs(
