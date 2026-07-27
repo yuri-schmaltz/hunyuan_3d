@@ -77,12 +77,19 @@ export interface JobEvent {
 export interface SystemMetrics {
     /** Seconds since the backend process started. */
     uptime_seconds: number;
-    /** CPU utilization of the backend process (0–100). */
-    cpu_percent: number;
-    /** Resident set size of the backend process, in bytes. */
-    ram_bytes: number;
-    /** Virtual memory size of the backend process, in bytes. */
-    vms_bytes: number;
+    /** Process-level metrics. The backend may also return the same
+        fields flat (legacy shape); both are accepted. */
+    process?: {
+        pid: number;
+        rss_mb: number;
+        vms_mb: number;
+        threads: number;
+        cpu_percent: number;
+    };
+    /** Legacy flat fields (some endpoints return these directly). */
+    cpu_percent?: number;
+    ram_bytes?: number;
+    vms_bytes?: number;
     /** GPU utilisation percentage (0–100), if a GPU is present. */
     gpu_percent?: number;
     /** GPU memory currently allocated, in bytes. */

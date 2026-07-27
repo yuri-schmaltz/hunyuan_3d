@@ -16,8 +16,8 @@ function pickKind(metrics: SystemMetrics | null, error: string | null): StatusKi
   return "live";
 }
 
-function fmtBytes(n: number): string {
-  if (!isFinite(n) || n <= 0) return "0 B";
+function fmtBytes(n: number | undefined | null): string {
+  if (n == null || !isFinite(n) || n <= 0) return "0 B";
   const units = ["B", "K", "M", "G", "T"];
   let i = 0;
   let v = n;
@@ -26,6 +26,33 @@ function fmtBytes(n: number): string {
     i++;
   }
   return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+// The backend may return process metrics nested (current shape) or flat
+// (legacy). These helpers normalise both so the rows below stay clean.
+function cpuPct(m: SystemMetrics): number | null {
+  if (m.process?.cpu_percent !== undefined) return m.process.cpu_percent;
+  return m.cpu_percent ?? null;
+}
+function ramMb(m: SystemMetrics): number | null {
+  if (m.process?.rss_mb !== undefined) return m.process.rss_mb;
+  if (m.ram_bytes !== undefined) return m.ram_bytes / (1024 * 1024);
+  return null;
+}
+function gpuPct(m: SystemMetrics): number | null {
+  return m.gpu_percent ?? null;
+}
+function gpuMemUsed(m: SystemMetrics): number | null {
+  if (m.gpu?.memory_allocated_mb !== undefined) {
+    return m.gpu.memory_allocated_mb * (1024 * 1024);
+  }
+  return m.gpu_mem_used ?? null;
+}
+function gpuMemTotal(m: SystemMetrics): number | null {
+  if (m.gpu?.memory_total_mb !== undefined) {
+    return m.gpu.memory_total_mb * (1024 * 1024);
+  }
+  return m.gpu_mem_total ?? null;
 }
 
 export const SystemMonitor: React.FC = () => {
@@ -55,57 +82,52 @@ export const SystemMonitor: React.FC = () => {
   }, []);
 
   const kind = pickKind(metrics, error);
+  const cpu = metrics ? cpuPct(metrics) : null;
+  const ramBytes = metrics
+    ? ramMb(metrics) !== null
+      ? ramMb(metrics)! * (1024 * 1024)
+      : null
+    : null;
+  const gpuU = metrics ? gpuPct(metrics) : null;
+  const gpuUsed = metrics ? gpuMemUsed(metrics) : null;
+  const gpuTotal = metrics ? gpuMemTotal(metrics) : null;
+  const jobsInMem = metrics?.jobs_in_memory;
+  const jobsInStore = metrics?.jobs_in_store;
+  const persist = metrics?.persistence_enabled;
+  const uptime = metrics?.uptime_seconds;
 
   return (
     <Stack gap={0} className="divide-y divide-border">
       <Row
         label="CPU (process)"
-        value={metrics ? `${metrics.cpu_percent.toFixed(1)}%` : "—"}
+        value={cpu !== null ? `${cpu.toFixed(1)}%` : "—"}
         kind={kind}
       />
-      <Row
-        label="RAM (process)"
-        value={metrics ? fmtBytes(metrics.ram_bytes) : "—"}
-        kind={kind}
-      />
-      {metrics?.gpu_percent !== undefined && (
-        <Row
-          label="GPU"
-          value={`${metrics.gpu_percent.toFixed(1)}%`}
-          kind={kind}
-        />
+      <Row label="RAM (process)" value={fmtBytes(ramBytes)} kind={kind} />
+      {gpuU !== null && (
+        <Row label="GPU" value={`${gpuU.toFixed(1)}%`} kind={kind} />
       )}
-      {metrics?.gpu_mem_used !== undefined && metrics?.gpu_mem_total !== undefined && (
+      {gpuUsed !== null && gpuTotal !== null && (
         <Row
           label="VRAM"
-          value={`${fmtBytes(metrics.gpu_mem_used)} / ${fmtBytes(metrics.gpu_mem_total)}`}
+          value={`${fmtBytes(gpuUsed)} / ${fmtBytes(gpuTotal)}`}
           kind={kind}
         />
       )}
       <Row
         label="Jobs in mem"
-        value={metrics?.jobs_in_memory !== undefined
-          ? String(metrics.jobs_in_memory)
-          : "—"}
+        value={jobsInMem !== undefined ? String(jobsInMem) : "—"}
         kind={kind}
       />
       <Row
         label="Jobs in store"
-        value={metrics?.jobs_in_store !== undefined
-          ? String(metrics.jobs_in_store)
-          : "—"}
+        value={jobsInStore !== undefined ? String(jobsInStore) : "—"}
         kind={kind}
       />
-      <Row
-        label="Persistence"
-        value={metrics?.persistence_enabled ? "on" : "off"}
-        kind={kind}
-      />
+      <Row label="Persistence" value={persist ? "on" : "off"} kind={kind} />
       <Row
         label="Uptime"
-        value={metrics?.uptime_seconds !== undefined
-          ? formatUptime(metrics.uptime_seconds)
-          : "—"}
+        value={uptime !== undefined ? formatUptime(uptime) : "—"}
         kind={kind}
       />
     </Stack>
