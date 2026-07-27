@@ -1,11 +1,36 @@
+/**
+ * Archeon 3D — Tailwind v4 theme bridge.
+ *
+ * Maps our design tokens (in design/tokens.css) into Tailwind's
+ * ``@theme`` directive so utility classes like ``text-fg``,
+ * ``bg-surface-1``, ``text-accent`` etc. resolve to the right CSS
+ * variables.
+ */
 @import "tailwindcss";
 
 @theme {
-  --color-archeon-bg: #0f172a;
-  --color-archeon-panel: #1e293b;
-  --color-archeon-primary: #3b82f6;
-}
+  /* Surfaces */
+  --color-bg: var(--color-bg);
+  --color-surface-1: var(--color-surface-1);
+  --color-surface-2: var(--color-surface-2);
+  --color-surface-3: var(--color-surface-3);
+  --color-border: var(--color-border);
+  --color-border-strong: var(--color-border-strong);
 
-body {
-  @apply bg-archeon-bg text-gray-200 antialiased;
+  /* Foreground */
+  --color-fg: var(--color-fg);
+  --color-fg-muted: var(--color-fg-muted);
+  --color-fg-dim: var(--color-fg-dim);
+
+  /* Accents */
+  --color-accent: var(--color-accent);
+  --color-accent-2: var(--color-accent-2);
+  --color-success: var(--color-success);
+  --color-warning: var(--color-warning);
+  --color-danger: var(--color-danger);
+
+  /* Type scale */
+  --font-mono: var(--font-mono);
+  --font-display: var(--font-display);
+  --font-sans: var(--font-body);
 }

@@ -1,85 +1,144 @@
-import React, { useEffect, useState } from 'react';
-import type { SystemMetrics } from '../../api/types';
-import { apiClient } from '../../api/client';
-import { Server, Cpu, CircuitBoard, Activity } from 'lucide-react';
+/**
+ * SystemMonitor — vertical stack of system metrics.
+ *
+ * Replaces the grid-of-cards layout. Each metric is a row with a
+ * mono label on the left, the value on the right, and a hairline
+ * divider between rows. Reads as a control panel readout.
+ */
+import React, { useEffect, useState } from "react";
+import type { SystemMetrics } from "../../api/types";
+import { apiClient } from "../../api/client";
+import { Text, StatusDot, Stack, type StatusKind } from "../../design/primitives";
+
+function pickKind(metrics: SystemMetrics | null, error: string | null): StatusKind {
+  if (error) return "off";
+  if (!metrics) return "queued";
+  return "live";
+}
+
+function fmtBytes(n: number): string {
+  if (!isFinite(n) || n <= 0) return "0 B";
+  const units = ["B", "K", "M", "G", "T"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
 
 export const SystemMonitor: React.FC = () => {
-    const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
-    const [error, setError] = useState<string | null>(null);
+  const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-    useEffect(() => {
-        const fetchMetrics = async () => {
-            try {
-                const response = await apiClient.get<SystemMetrics>('/system/metrics');
-                setMetrics(response.data);
-                setError(null);
-            } catch (err) {
-                console.error("Failed to fetch metrics", err);
-                setError("Offline");
-            }
-        };
+  useEffect(() => {
+    let alive = true;
+    const fetchMetrics = async () => {
+      try {
+        const response = await apiClient.get<SystemMetrics>("/system/metrics");
+        if (!alive) return;
+        setMetrics(response.data);
+        setError(null);
+      } catch (err) {
+        if (!alive) return;
+        console.error("Failed to fetch metrics", err);
+        setError("Offline");
+      }
+    };
+    fetchMetrics();
+    const interval = setInterval(fetchMetrics, 2000);
+    return () => {
+      alive = false;
+      clearInterval(interval);
+    };
+  }, []);
 
-        fetchMetrics();
-        const interval = setInterval(fetchMetrics, 2000);
-        return () => clearInterval(interval);
-    }, []);
+  const kind = pickKind(metrics, error);
 
-    if (error) return <div className="text-red-500 text-sm flex items-center gap-2"><Activity size={16} /> Backend Offline</div>;
-    if (!metrics) return <div className="text-gray-500 text-sm animate-pulse">Scanning system...</div>;
-
-    return (
-        <div className="bg-archeon-panel p-4 rounded-lg border border-gray-700 space-y-4 shadow-lg">
-            <h3 className="text-sm font-semibold text-gray-400 flex items-center gap-2 border-b border-gray-700 pb-2">
-                <Server size={16} className="text-archeon-primary" /> SYSTEM VITALS
-            </h3>
-
-            {/* CPU (process-level) */}
-            <div className="space-y-1">
-                <div className="flex justify-between text-xs text-gray-300">
-                    <span className="flex items-center gap-1"><Cpu size={12} /> CPU (proc)</span>
-                    <span>{metrics.cpu_percent.toFixed(1)}%</span>
-                </div>
-                <div className="h-1.5 w-full bg-gray-800 rounded-full overflow-hidden">
-                    <div
-                        className="h-full bg-blue-500 transition-all duration-500 ease-out"
-                        style={{ width: `${Math.min(100, metrics.cpu_percent)}%` }}
-                    />
-                </div>
-            </div>
-
-            {/* RAM (process RSS) */}
-            <div className="space-y-1">
-                <div className="flex justify-between text-xs text-gray-300">
-                    <span className="flex items-center gap-1"><CircuitBoard size={12} /> RAM (proc)</span>
-                    <span>{metrics.rss_mb.toFixed(0)} MB</span>
-                </div>
-                <div className="text-[10px] text-gray-500 text-right">
-                    VMS {metrics.vms_mb.toFixed(0)} MB &middot; uptime {Math.floor(metrics.uptime_seconds / 60)}m
-                </div>
-            </div>
-
-            {/* GPU */}
-            {metrics.gpu && (
-                <div className="space-y-1 pt-2 border-t border-gray-700/50">
-                    <div className="flex justify-between text-xs text-gray-300">
-                        <span className="flex items-center gap-1"><Activity size={12} /> VRAM ({metrics.gpu.name})</span>
-                        <span>
-                            {((metrics.gpu.memory_allocated_mb / metrics.gpu.memory_total_mb) * 100).toFixed(1)}%
-                        </span>
-                    </div>
-                    <div className="h-1.5 w-full bg-gray-800 rounded-full overflow-hidden">
-                        <div
-                            className="h-full bg-green-500 transition-all duration-500 ease-out"
-                            style={{
-                                width: `${Math.min(100, (metrics.gpu.memory_allocated_mb / metrics.gpu.memory_total_mb) * 100)}%`,
-                            }}
-                        />
-                    </div>
-                    <div className="text-[10px] text-gray-500 text-right">
-                        {metrics.gpu.memory_allocated_mb.toFixed(0)} MB allocated &middot; {metrics.gpu.memory_reserved_mb.toFixed(0)} MB reserved &middot; {metrics.gpu.memory_total_mb.toFixed(0)} MB total
-                    </div>
-                </div>
-            )}
-        </div>
-    );
+  return (
+    <Stack gap={0} className="divide-y divide-border">
+      <Row
+        label="CPU (process)"
+        value={metrics ? `${metrics.cpu_percent.toFixed(1)}%` : "—"}
+        kind={kind}
+      />
+      <Row
+        label="RAM (process)"
+        value={metrics ? fmtBytes(metrics.ram_bytes) : "—"}
+        kind={kind}
+      />
+      {metrics?.gpu_percent !== undefined && (
+        <Row
+          label="GPU"
+          value={`${metrics.gpu_percent.toFixed(1)}%`}
+          kind={kind}
+        />
+      )}
+      {metrics?.gpu_mem_used !== undefined && metrics?.gpu_mem_total !== undefined && (
+        <Row
+          label="VRAM"
+          value={`${fmtBytes(metrics.gpu_mem_used)} / ${fmtBytes(metrics.gpu_mem_total)}`}
+          kind={kind}
+        />
+      )}
+      <Row
+        label="Jobs in mem"
+        value={metrics?.jobs_in_memory !== undefined
+          ? String(metrics.jobs_in_memory)
+          : "—"}
+        kind={kind}
+      />
+      <Row
+        label="Jobs in store"
+        value={metrics?.jobs_in_store !== undefined
+          ? String(metrics.jobs_in_store)
+          : "—"}
+        kind={kind}
+      />
+      <Row
+        label="Persistence"
+        value={metrics?.persistence_enabled ? "on" : "off"}
+        kind={kind}
+      />
+      <Row
+        label="Uptime"
+        value={metrics?.uptime_seconds !== undefined
+          ? formatUptime(metrics.uptime_seconds)
+          : "—"}
+        kind={kind}
+      />
+    </Stack>
+  );
 };
+
+const Row: React.FC<{ label: string; value: string; kind: StatusKind }> = ({
+  label,
+  value,
+  kind,
+}) => (
+  <div className="py-3 flex items-baseline justify-between gap-3">
+    <div className="flex items-center gap-2">
+      <StatusDot kind={kind} size={5} />
+      <Text
+        voice="mono"
+        size="2xs"
+        tone="muted"
+        tracking="widest"
+        uppercase
+      >
+        {label}
+      </Text>
+    </div>
+    <Text voice="mono" size="sm" tone="fg" className="tabular-nums">
+      {value}
+    </Text>
+  </div>
+);
+
+function formatUptime(seconds: number): string {
+  if (seconds < 60) return `${Math.floor(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
