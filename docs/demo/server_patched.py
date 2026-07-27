@@ -1,6 +1,12 @@
-"""Same as hy3dgen.api.server but with the worker disabled (idle loop)."""
+"""Same as hy3dgen.api.server but with the worker disabled (idle loop).
+
+Listens on ARCHEON_PORT (default 8765). Used by the demo and the
+stress-test suite (which override ARCHEON_PORT to avoid clashing with
+the real backend).
+"""
+import os
 import sys
-sys.path.insert(0, "/workspace/my-hunyuan-3D/.worktrees/feature-ui")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import hy3dgen.api.manager as _mgr
 import asyncio
@@ -15,4 +21,5 @@ from hy3dgen.api.server import app
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8765, log_level="warning")
+    port = int(os.environ.get("ARCHEON_PORT", "8765"))
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
