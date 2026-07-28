@@ -96,28 +96,12 @@ async def list_jobs(manager: ManagerDep) -> list[JobResponse]:
     )
 
 
-@router.get(
-    "/jobs/{uid}",
-    response_model=JobResponse,
-    responses={404: {"description": "Job not found"}},
-)
-async def get_job_status(uid: str, manager: ManagerDep) -> JobResponse:
-    """Retrieve job status and result path."""
-    job = manager.get_job(uid)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
-
-
-@router.delete("/jobs/{uid}")
-async def cancel_job(uid: str, manager: ManagerDep) -> dict:
-    """Request job cancellation. Idempotent — unknown uids return ok."""
-    manager.cancel_job(uid)
-    return {"status": "cancellation_requested", "uid": uid}
-
-
 # ---------------------------------------------------------------------------
-# Real-time endpoints (SSE)
+# Real-time endpoints (SSE).
+# IMPORTANT: registered BEFORE /jobs/{uid} so the literal paths
+# (/jobs/events, /jobs/{uid}/events) win over the catch-all. FastAPI/
+# Starlette match in registration order, not by path specificity, so
+# this ordering is load-bearing.
 # ---------------------------------------------------------------------------
 #
 # NOTE: FastAPI/Starlette match routes in registration order, not by
@@ -220,6 +204,25 @@ async def stream_job_events(
             manager.unsubscribe(uid, queue)
 
     return EventSourceResponse(event_publisher())
+
+@router.get(
+    "/jobs/{uid}",
+    response_model=JobResponse,
+    responses={404: {"description": "Job not found"}},
+)
+async def get_job_status(uid: str, manager: ManagerDep) -> JobResponse:
+    """Retrieve job status and result path."""
+    job = manager.get_job(uid)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@router.delete("/jobs/{uid}")
+async def cancel_job(uid: str, manager: ManagerDep) -> dict:
+    """Request job cancellation. Idempotent — unknown uids return ok."""
+    manager.cancel_job(uid)
+    return {"status": "cancellation_requested", "uid": uid}
 
 
 # ---------------------------------------------------------------------------
