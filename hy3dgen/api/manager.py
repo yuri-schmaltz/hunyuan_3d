@@ -25,6 +25,24 @@ from hy3dgen.inference import ModelWorker
 logger = logging.getLogger(__name__)
 
 
+def _status_transition(job: "JobResponse", expected: "JobStatus", new: "JobStatus") -> bool:
+    """Atomically set ``job.status = new`` only if the current status is
+    ``expected``. Returns True if the transition happened, False if the
+    status had already changed (caller should treat as a no-op race).
+
+    This is the manager-level equivalent of a compare-and-swap. The
+    Python GIL makes the read+write effectively atomic for a single
+    attribute on a single object, so no lock is needed.
+
+    Used by cancel_job to avoid racing with the worker pulling the
+    job off the queue.
+    """
+    if job.status != expected:
+        return False
+    job.status = new
+    return True
+
+
 class PriorityRequestManager:
     """
     Manages generation requests with priority queuing and resource cleanup.
@@ -282,10 +300,28 @@ class PriorityRequestManager:
 
     async def cancel_job(self, uid: str) -> None:
         # We can only cancel jobs that are still in the queue.
+        # Anything already processing is mid-inference and can't be
+        # safely interrupted from here (ModelWorker is a blocking call
+        # running in a thread). We log a warning so the caller knows
+        # their cancel request was a no-op rather than silently failing.
         job = self.jobs.get(uid)
-        if job is None or job.status != JobStatus.QUEUED:
+        if job is None:
             return
-        job.status = JobStatus.CANCELLED
+        if job.status == JobStatus.PROCESSING:
+            logger.warning(
+                f"cancel_job({uid}): job is already processing; cannot interrupt "
+                f"in-flight inference. Wait for completion or failure."
+            )
+            return
+        if job.status != JobStatus.QUEUED:
+            return
+        # Atomic check-and-set: only flip the status if it's still QUEUED.
+        # Without this guard, a racing _process_queue could have already
+        # moved the job to PROCESSING between our get() and the status
+        # write, leaving us with a CANCELLED job that still ran.
+        if not _status_transition(job, JobStatus.QUEUED, JobStatus.CANCELLED):
+            logger.debug(f"cancel_job({uid}): status changed under us, skipping")
+            return
         job.error = "Cancelled by user"
         logger.info(f"Job {uid} cancelled")
         await self._persist(job)
@@ -294,19 +330,50 @@ class PriorityRequestManager:
     async def _process_queue(self):
         while not self._shutdown_event.is_set():
             try:
-                # Wait for job
-                _, _, uid, request, save_dir = await self.queue.get()
-
-                # Check status
-                if uid not in self.jobs or self.jobs[uid].status in (JobStatus.CANCELLED, JobStatus.FAILED):
-                    self.queue.task_done()
+                # Wait for a job OR the shutdown event. Without this, a
+                # stop() call would block until the next job arrives
+                # (which on a quiet server could be forever).
+                get_task = asyncio.create_task(self.queue.get())
+                shutdown_task = asyncio.create_task(self._shutdown_event.wait())
+                done, pending = await asyncio.wait(
+                    {get_task, shutdown_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+                if shutdown_task in done:
+                    # Drain the queue so unstarted jobs get marked failed
+                    # rather than silently dropped on shutdown.
+                    await self._drain_queue_on_shutdown()
+                    break
+                if get_task not in done:
                     continue
+                _, _, uid, request, save_dir = get_task.result()
+                try:
+                    # Check status; cancel/fail means we skip the job but
+                    # still mark the queue slot done so task_done() counts
+                    # stay balanced.
+                    if uid not in self.jobs or self.jobs[uid].status in (JobStatus.CANCELLED, JobStatus.FAILED):
+                        self.queue.task_done()
+                        continue
 
-                # Run job
-                await self._execute_model_worker(uid, request, save_dir)
+                    # Re-check shutdown before starting an expensive
+                    # inference - we don't want to spin up a new job
+                    # while the user is trying to stop the server.
+                    if self._shutdown_event.is_set():
+                        self.queue.task_done()
+                        break
+
+                    # Run job
+                    await self._execute_model_worker(uid, request, save_dir)
+                finally:
+                    # Always mark the queue slot done, even on exception
+                    # (the previous version only called task_done on the
+                    # happy path, which could leak unfinished-task
+                    # counters and break queue.join() callers).
+                    self.queue.task_done()
 
                 # Cleanup
-                self.queue.task_done()
                 self._aggressive_cleanup()
 
             except asyncio.CancelledError:
@@ -406,6 +473,28 @@ class PriorityRequestManager:
             end_span(span, error=e)
             await self._persist(job)
             self._notify(job)
+
+    async def _drain_queue_on_shutdown(self) -> None:
+        """Called when the worker is stopping. Marks any pending QUEUED
+        jobs as CANCELLED so the user sees a clear reason rather than
+        the jobs silently disappearing.
+        """
+        drained = 0
+        while not self.queue.empty():
+            try:
+                _, _, uid, _request, _save_dir = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            job = self.jobs.get(uid)
+            if job is not None and job.status == JobStatus.QUEUED:
+                _status_transition(job, JobStatus.QUEUED, JobStatus.CANCELLED)
+                job.error = "Server shutting down"
+                await self._persist(job)
+                self._notify(job)
+                drained += 1
+            self.queue.task_done()
+        if drained:
+            logger.info(f"Drained {drained} queued job(s) on shutdown")
 
     def _aggressive_cleanup(self):
         """Perform aggressive garbage collection and bounded history cleanup."""
