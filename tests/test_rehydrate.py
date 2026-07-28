@@ -19,7 +19,7 @@ from hy3dgen.api.persistence import JobStore
 from hy3dgen.api.schemas import JobRequest, JobStatus, JobResponse, TextTo3DRequest
 
 
-def _build_manager_with_active_job(payload: dict | None) -> PriorityRequestManager:
+async def _build_manager_with_active_job(payload: dict | None) -> PriorityRequestManager:
     """Spin up a manager, write a QUEUED job to the store, and stop.
 
     Returns the manager; the caller can call ``rehydrate()`` to drive
@@ -40,13 +40,13 @@ def _build_manager_with_active_job(payload: dict | None) -> PriorityRequestManag
         created_at=datetime.utcnow().isoformat(),
     )
     m.jobs[job.uid] = job
-    m._persist(job, payload=payload)
+    await m._persist(job, payload=payload)
     # Empty in-memory queue (the new manager has nothing in it).
     return m
 
 
 class TestRehydrateWithPayload:
-    def test_rehydrated_queued_job_with_payload_is_replayed(self):
+    async def test_rehydrated_queued_job_with_payload_is_replayed(self):
         payload = {
             "type": "text_to_3d",
             "prompt": "a small red cube",
@@ -54,11 +54,11 @@ class TestRehydrateWithPayload:
             "steps": 50,
             "seed": 1234,
         }
-        m = _build_manager_with_active_job(payload)
+        m = await _build_manager_with_active_job(payload)
         # Clear the in-memory jobs dict to simulate a fresh process.
         m.jobs.clear()
         m.queue = asyncio.PriorityQueue()  # ensure empty
-        n = m.rehydrate()
+        n = await m.rehydrate()
         assert n == 1
         assert "abc-123" in m.jobs
         # The job is in the queue with a non-None request.
@@ -71,10 +71,10 @@ class TestRehydrateWithPayload:
         assert isinstance(request, TextTo3DRequest)
         assert request.prompt == "a small red cube"
 
-    def test_rehydrated_queued_job_without_payload_is_marked_failed(self):
-        m = _build_manager_with_active_job(None)
+    async def test_rehydrated_queued_job_without_payload_is_marked_failed(self):
+        m = await _build_manager_with_active_job(None)
         m.jobs.clear()
-        n = m.rehydrate()
+        n = await m.rehydrate()
         assert n == 1
         job = m.jobs["abc-123"]
         assert job.status == JobStatus.FAILED
@@ -82,11 +82,11 @@ class TestRehydrateWithPayload:
         # And nothing in the queue.
         assert m.queue.empty()
 
-    def test_rehydrated_queued_job_with_bad_payload_is_marked_failed(self):
+    async def test_rehydrated_queued_job_with_bad_payload_is_marked_failed(self):
         # Not a valid JobRequest (missing required fields).
-        m = _build_manager_with_active_job({"type": "unknown_kind"})
+        m = await _build_manager_with_active_job({"type": "unknown_kind"})
         m.jobs.clear()
-        m.rehydrate()
+        await m.rehydrate()
         job = m.jobs["abc-123"]
         assert job.status == JobStatus.FAILED
         assert "deserializ" in (job.error or "").lower()
