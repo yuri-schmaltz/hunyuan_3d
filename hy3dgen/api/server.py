@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import logging
 import os
 
 from fastapi import Depends, FastAPI
@@ -7,17 +8,34 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from hy3dgen.api import auth as _auth_module
 from hy3dgen.api.auth import require_api_key
-from hy3dgen.api.config import SAVE_DIR, get_bind_host, get_cors_origins
+from hy3dgen.api.config import (
+    SAVE_DIR,
+    get_bind_host,
+    get_cors_origins,
+    get_job_db_path,
+)
 from hy3dgen.api.manager import PriorityRequestManager
+from hy3dgen.api.persistence import JobStore
 from hy3dgen.api.routes import router
 from hy3dgen.meshops.processor import MeshProcessor
+
+logger = logging.getLogger("hy3dgen.api.server")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle (start/stop background workers)."""
-    # Initialize manager
-    app.state.manager = PriorityRequestManager()
+    # Initialize the persistent store (or None to disable).
+    db_path = get_job_db_path()
+    store = JobStore(db_path) if db_path else None
+    if store is not None:
+        logger.info("JobStore initialized at %s", db_path)
+
+    # Initialize manager with optional store, then start the worker loop.
+    # ``start()`` rehydrates from the store before kicking off the
+    # processing task, so jobs that were mid-flight when the process
+    # died are recovered.
+    app.state.manager = PriorityRequestManager(store=store)
     await app.state.manager.start()
 
     # Initialize processor

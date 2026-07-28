@@ -10,16 +10,25 @@ from datetime import datetime
 from typing import Dict, Optional, Tuple, Any
 
 from hy3dgen.inference import ModelWorker
+from hy3dgen.api.persistence import JobStore
 from hy3dgen.api.schemas import JobStatus, JobResponse, JobRequest
 
 logger = logging.getLogger(__name__)
+
 
 class PriorityRequestManager:
     """
     Manages generation requests with priority queuing and resource cleanup.
     Ensures single-threaded execution of model inference to prevent VRAM OOM.
     """
-    def __init__(self, device='cuda', max_concurrent=1, max_history: int = 1000):
+
+    def __init__(
+        self,
+        device='cuda',
+        max_concurrent=1,
+        max_history: int = 1000,
+        store: Optional[JobStore] = None,
+    ):
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
         self.jobs: Dict[str, JobResponse] = {}
         self.device = device
@@ -36,12 +45,51 @@ class PriorityRequestManager:
         # Cleared automatically on the next successful job.
         self.last_error: Optional[str] = None
 
+        # Optional SQLite-backed persistence. When set, every job transition
+        # is mirrored to disk and the in-memory state is rehydrated on start.
+        self.store: Optional[JobStore] = store
+
+        # Per-job subscribers. ``subscribers[uid]`` is a list of asyncio
+        # Queues; on each status change we put the new JobResponse on every
+        # queue. SSE handlers consume one queue each.
+        self._subscribers: Dict[str, list[asyncio.Queue]] = {}
+        self._subs_lock = threading.Lock()
+
         # Lazy initialization of the worker to speed up startup
         self.worker: Optional[ModelWorker] = None
-        
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def rehydrate(self) -> int:
+        """Restore jobs from the persistent store into memory.
+
+        Returns the number of jobs rehydrated. Active jobs (queued or
+        processing) are requeued with their original priority so they
+        resume after a restart. Terminal jobs are loaded as-is to
+        preserve the history.
+        """
+        if self.store is None:
+            return 0
+        count = 0
+        for job, _payload in self.store.restore_all():
+            self.jobs[job.uid] = job
+            count += 1
+            if job.status in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                # Mid-flight jobs that died with the process are
+                # requeued. We don't know the original priority, so
+                # we use a high value (low priority) to make sure we
+                # don't jump in front of anything new.
+                self.queue.put_nowait((100, time.time(), job.uid, None, None))
+                logger.info(f"Re-queued active job {job.uid} after restart.")
+        logger.info(f"Rehydrated {count} jobs from persistent store.")
+        return count
+
     async def start(self):
         """Start the background worker loop."""
         if self._worker_task is None:
+            self.rehydrate()
             self._worker_task = asyncio.create_task(self._process_queue())
             logger.info("PriorityRequestManager worker started.")
 
@@ -56,15 +104,24 @@ class PriorityRequestManager:
                 pass
         logger.info("PriorityRequestManager worker stopped.")
 
-    async def submit_job(self, request: JobRequest, save_dir: str, priority: int = 10) -> str:
-        """
-        Submit a job to the queue.
-        
+    async def submit_job(
+        self,
+        request: JobRequest,
+        save_dir: str,
+        priority: int = 10,
+        _payload: Optional[dict] = None,
+    ) -> str:
+        """Submit a job to the queue.
+
         Args:
             request: The generation request (polymorphic)
             save_dir: Directory to save output
             priority: Lower number = higher priority. Default 10.
-        
+            _payload: Optional serialised request (used by rehydration
+                so the original request body can be replayed after a
+                restart). Normally callers should pass only ``request``
+                and let ``_payload`` default to ``request.model_dump()``.
+
         Returns:
             uid: The unique job ID
         """
@@ -75,11 +132,14 @@ class PriorityRequestManager:
             created_at=datetime.utcnow().isoformat()
         )
         self.jobs[uid] = job
-        
+
         # Queue item: (priority, timestamp, uid, request, save_dir)
         # timestamp acts as secondary sort key for FIFO within same priority
         await self.queue.put((priority, time.time(), uid, request, save_dir))
         logger.info(f"Job {uid} queued with priority {priority}")
+        # Persist the initial state and notify any early subscribers.
+        self._persist(job, payload=_payload or (request.model_dump() if request else None))
+        self._notify(job)
         return uid
 
     def get_job(self, uid: str) -> Optional[JobResponse]:
@@ -113,6 +173,8 @@ class PriorityRequestManager:
         for _, uid in victims:
             del self.jobs[uid]
             self._evicted_total += 1
+            if self.store is not None:
+                self.store.delete(uid)
         if victims:
             logger.info(f"Evicted {len(victims)} old jobs (older than {max_age_seconds}s).")
         return len(victims)
@@ -142,6 +204,8 @@ class PriorityRequestManager:
         for uid, _ in sortable[:to_remove]:
             del self.jobs[uid]
             self._evicted_total += 1
+            if self.store is not None:
+                self.store.delete(uid)
         if to_remove > 0:
             logger.info(f"Evicted {to_remove} jobs to respect max_history={self.max_history}.")
         return to_remove
@@ -153,6 +217,8 @@ class PriorityRequestManager:
                 self.jobs[uid].status = JobStatus.CANCELLED
                 self.jobs[uid].error = "Cancelled by user"
                 logger.info(f"Job {uid} cancelled")
+                self._persist(self.jobs[uid])
+                self._notify(self.jobs[uid])
 
     async def _process_queue(self):
         while not self._shutdown_event.is_set():
@@ -181,13 +247,23 @@ class PriorityRequestManager:
     async def _execute_model_worker(self, uid: str, request: JobRequest, save_dir: str):
         job = self.jobs[uid]
         job.status = JobStatus.PROCESSING
+        self._persist(job)
+        self._notify(job)
 
         try:
             # Validate texture_mesh has a reference (image or prompt) before
             # spinning up the worker.
-            if request.type == 'texture_mesh' and not getattr(request, 'has_reference', False):
+            if request and request.type == 'texture_mesh' and not getattr(request, 'has_reference', False):
                 raise ValueError(
                     "texture_mesh requires at least one of: image, prompt."
+                )
+
+            # If we were rehydrated after a restart, request is None; we
+            # can't replay the job without its original payload. Mark it
+            # failed and move on.
+            if request is None:
+                raise RuntimeError(
+                    "Job payload missing (server restarted mid-flight). Cannot replay."
                 )
 
             # Initialize worker if needed (Lazy Loading)
@@ -231,6 +307,8 @@ class PriorityRequestManager:
             logger.info(f"Job {uid} completed successfully")
             # Clear the last_error latch after a success.
             self.last_error = None
+            self._persist(job)
+            self._notify(job)
 
         except Exception as e:
             logger.error(f"Job {uid} failed: {e}")
@@ -241,6 +319,8 @@ class PriorityRequestManager:
             job.completed_at = datetime.utcnow().isoformat()
             # Track the most recent failure so /health can surface it.
             self.last_error = f"{type(e).__name__}: {e}"
+            self._persist(job)
+            self._notify(job)
 
     def _aggressive_cleanup(self):
         """Perform aggressive garbage collection and bounded history cleanup."""
@@ -252,3 +332,56 @@ class PriorityRequestManager:
         # (would be wasteful for short bursts), but we do check periodically.
         if self.max_history > 0 and len(self.jobs) > self.max_history * 1.2:
             self.evict_to_size()
+
+    # ------------------------------------------------------------------
+    # Persistence + pub/sub
+    # ------------------------------------------------------------------
+
+    def _persist(self, job: JobResponse, payload: Optional[dict] = None) -> None:
+        """Mirror a job transition to the persistent store. No-op without one."""
+        if self.store is None:
+            return
+        try:
+            self.store.upsert(job, request_payload=payload)
+        except Exception as e:  # never let persistence failures kill the worker
+            logger.warning(f"Failed to persist job {job.uid}: {e}")
+
+    def _notify(self, job: JobResponse) -> None:
+        """Fan out a job update to every subscriber of this uid."""
+        with self._subs_lock:
+            queues = list(self._subscribers.get(job.uid, ()))
+        for q in queues:
+            try:
+                q.put_nowait(job)
+            except asyncio.QueueFull:  # pragma: no cover (unbounded queue)
+                logger.warning(f"Subscriber queue full for {job.uid}; dropping event")
+
+    def subscribe(self, uid: str) -> asyncio.Queue:
+        """Register a new subscriber for ``uid`` and return its queue.
+
+        The caller is expected to read the queue and call
+        ``unsubscribe(uid, queue)`` when done. The first item on the
+        queue is the current job state (so consumers don't have to
+        separately fetch it).
+        """
+        q: asyncio.Queue = asyncio.Queue()
+        with self._subs_lock:
+            self._subscribers.setdefault(uid, []).append(q)
+        # Prime the queue with the current state so the consumer has it
+        # immediately, even if no further transitions happen.
+        current = self.jobs.get(uid) or (self.store.get(uid) if self.store else None)
+        if current is not None:
+            q.put_nowait(current)
+        return q
+
+    def unsubscribe(self, uid: str, queue: asyncio.Queue) -> None:
+        with self._subs_lock:
+            listeners = self._subscribers.get(uid)
+            if not listeners:
+                return
+            try:
+                listeners.remove(queue)
+            except ValueError:
+                pass
+            if not listeners:
+                self._subscribers.pop(uid, None)

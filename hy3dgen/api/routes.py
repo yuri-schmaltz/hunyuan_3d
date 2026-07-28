@@ -1,8 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 import os
 import os
 import asyncio
-from typing import List, Dict
+import json
+from typing import List, Dict, AsyncIterator
+from sse_starlette.sse import EventSourceResponse
 from hy3dgen.api.schemas import JobRequest, JobResponse, MeshOpsRequest
 from hy3dgen.api.deps import get_manager, get_mesh_processor
 from hy3dgen.api.manager import PriorityRequestManager
@@ -11,6 +13,9 @@ from hy3dgen.monitoring import get_system_metrics
 from hy3dgen.api.config import SAVE_DIR
 
 router = APIRouter(prefix="/v1", tags=["generation"])
+
+# Terminal job states that should close the SSE stream.
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
 # Default save directory (following XDG specs)
 # We might want to pass this via config later
@@ -56,6 +61,55 @@ async def cancel_job(
     """Request job cancellation."""
     manager.cancel_job(uid)
     return {"status": "cancellation_requested", "uid": uid}
+
+
+@router.get("/jobs/{uid}/events")
+async def stream_job_events(
+    uid: str,
+    request: Request,
+    manager: PriorityRequestManager = Depends(get_manager),
+) -> EventSourceResponse:
+    """Server-Sent Events stream of job state changes.
+
+    The first event is the current state, so a client that connects after
+    a job has already started still gets the latest status. Subsequent
+    events are sent whenever the job transitions to a new state. The
+    stream closes after a terminal status (completed/failed/cancelled)
+    is sent, or when the client disconnects.
+    """
+    # If we don't even know about the uid, return 404 instead of an
+    # open-ended stream.
+    if manager.get_job(uid) is None and (
+        manager.store is None or manager.store.get(uid) is None
+    ):
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    queue = manager.subscribe(uid)
+
+    async def event_publisher() -> AsyncIterator[Dict]:
+        try:
+            while True:
+                # Bail out promptly if the client has gone away.
+                if await request.is_disconnected():
+                    break
+                try:
+                    job: JobResponse = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    # Keep-alive ping so proxies don't time out the connection.
+                    yield {"event": "ping", "data": "{}"}
+                    continue
+                payload = job.model_dump(mode="json")
+                yield {
+                    "event": "status",
+                    "id": job.uid,
+                    "data": json.dumps(payload, default=str),
+                }
+                if str(job.status) in _TERMINAL_STATUSES:
+                    break
+        finally:
+            manager.unsubscribe(uid, queue)
+
+    return EventSourceResponse(event_publisher())
 
 @router.get("/system/metrics", tags=["system"])
 async def get_metrics():

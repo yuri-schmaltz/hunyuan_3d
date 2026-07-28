@@ -5,6 +5,7 @@ import type { JobResponse, JobStatusType } from '../../api/types';
 import { RefreshCw, CheckCircle, Clock, XCircle, AlertTriangle, Download, Scissors, X, Eye, EyeOff } from 'lucide-react';
 import { MeshPreview } from './MeshPreview';
 import { useJobEvents } from '../../context/useJobEvents';
+import { useJobStream } from '../../api/useJobStream';
 
 const POLL_INTERVAL_MS = 2000;
 // Cap the exponential backoff so a flapping backend doesn't degrade to multi-minute polls.
@@ -27,6 +28,10 @@ export const JobGallery: React.FC = () => {
     const [error, setError] = useState<string | null>(null);
     const [previewingUid, setPreviewingUid] = useState<string | null>(null);
     const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+    const { job: streamedJob, connected: sseConnected, isFallback: sseFallback } = useJobStream(
+        BASE_URL, previewingUid,
+        { enabled: previewingUid !== null },
+    );
     const inFlight = useRef(false);
     // Exponential backoff state for polling after a failure.
     const consecutiveFailures = useRef(0);
@@ -152,7 +157,11 @@ export const JobGallery: React.FC = () => {
         }
     };
 
-    const previewedJob = previewingUid ? jobs.find((j) => j.uid === previewingUid) ?? null : null;
+    const previewedFromList = previewingUid ? jobs.find((j) => j.uid === previewingUid) ?? null : null;
+    // When the user is previewing a job, prefer the live (SSE/polled)
+    // view of the same job so the GLB appears the moment the backend
+    // marks it completed. Falls back to the cached copy from the list.
+    const previewedJob = previewingUid && streamedJob ? streamedJob : previewedFromList;
 
     return (
         <div className="bg-archeon-panel border border-gray-700 rounded-lg p-6 h-full overflow-y-auto max-h-[600px]">
@@ -165,6 +174,16 @@ export const JobGallery: React.FC = () => {
                 >
                     <RefreshCw size={16} />
                 </button>
+                {previewingUid && (
+                    <span
+                        className="text-[10px] text-gray-500 ml-1"
+                        aria-live="polite"
+                        title={sseFallback ? 'Live updates via polling' : 'Live updates via SSE'}
+                    >
+                        <span className={`inline-block w-2 h-2 rounded-full mr-1 ${sseConnected ? 'bg-emerald-500' : 'bg-gray-500'}`}></span>
+                        {sseFallback ? 'polling' : sseConnected ? 'live' : 'connecting'}
+                    </span>
+                )}
             </h3>
 
             {/* Status filter tabs. Counts are computed from the in-memory

@@ -114,6 +114,57 @@ def _wait_for_completion(
     raise SystemExit(f"Job {uid} did not complete within {timeout:.0f}s.")
 
 
+def _wait_via_sse(
+    api_url: str, uid: str, *, api_key: str | None, timeout: float = POLL_TIMEOUT
+) -> dict:
+    """Stream job status updates over SSE.
+
+    Reads the stream line by line, parses the ``data:`` lines as JSON,
+    and stops at the first terminal status. Falls back gracefully if
+    the server doesn't support SSE.
+    """
+    url = f"{api_url}/v1/jobs/{uid}/events"
+    headers = {"Accept": "text/event-stream", **({"X-API-Key": api_key} if api_key else {})}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise SystemExit(f"Job {uid} not found.") from None
+        raise SystemExit(f"SSE failed: HTTP {e.code} {e.reason}") from None
+    except urllib.error.URLError as e:
+        raise SystemExit(f"Could not reach the backend at {url}: {e.reason}") from None
+
+    deadline = time.monotonic() + timeout
+    last_status: str | None = None
+    try:
+        for raw in resp:
+            if time.monotonic() > deadline:
+                raise SystemExit(f"Job {uid} did not complete within {timeout:.0f}s.")
+            line = raw.decode("utf-8", errors="ignore").rstrip("\r\n")
+            if not line or not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if not payload or payload == "{}":
+                continue  # keep-alive ping
+            try:
+                event = cast(dict, json.loads(payload))
+            except json.JSONDecodeError:
+                continue
+            status = event.get("status")
+            if status != last_status:
+                print(f"  job {uid[:8]} status: {status}")
+                last_status = status
+            if status == "completed":
+                return event
+            if status in ("failed", "cancelled"):
+                err = event.get("error", "unknown")
+                raise SystemExit(f"Job {uid} {status}: {err}")
+    finally:
+        resp.close()
+    raise SystemExit(f"Job {uid} stream ended without a terminal status.")
+
+
 def _download(file_path: str, output: Path, api_url: str) -> None:
     basename = os.path.basename(file_path)
     url = f"{api_url}/files/{urllib.parse.quote(basename)}"
@@ -145,7 +196,7 @@ def _cmd_text(args: argparse.Namespace) -> int:
     job = _request("POST", f"{args.api_url}/v1/jobs", data=payload, api_key=args.api_key)
     uid = job["uid"]
     print(f"Submitted {uid}.")
-    final = _wait_for_completion(args.api_url, uid, api_key=args.api_key, timeout=args.timeout)
+    final = _maybe_stream_wait(args, uid)
     if final.get("file_path") and args.output:
         _download(final["file_path"], Path(args.output), args.api_url)
     return 0
@@ -166,7 +217,7 @@ def _cmd_image(args: argparse.Namespace) -> int:
     job = _request("POST", f"{args.api_url}/v1/jobs", data=payload, api_key=args.api_key)
     uid = job["uid"]
     print(f"Submitted {uid}.")
-    final = _wait_for_completion(args.api_url, uid, api_key=args.api_key, timeout=args.timeout)
+    final = _maybe_stream_wait(args, uid)
     if final.get("file_path") and args.output:
         _download(final["file_path"], Path(args.output), args.api_url)
     return 0
@@ -191,7 +242,7 @@ def _cmd_multiview(args: argparse.Namespace) -> int:
     job = _request("POST", f"{args.api_url}/v1/jobs", data=payload, api_key=args.api_key)
     uid = job["uid"]
     print(f"Submitted {uid}.")
-    final = _wait_for_completion(args.api_url, uid, api_key=args.api_key, timeout=args.timeout)
+    final = _maybe_stream_wait(args, uid)
     if final.get("file_path") and args.output:
         _download(final["file_path"], Path(args.output), args.api_url)
     return 0
@@ -217,7 +268,7 @@ def _cmd_texture_mesh(args: argparse.Namespace) -> int:
     job = _request("POST", f"{args.api_url}/v1/jobs", data=payload, api_key=args.api_key)
     uid = job["uid"]
     print(f"Submitted {uid}.")
-    final = _wait_for_completion(args.api_url, uid, api_key=args.api_key, timeout=args.timeout)
+    final = _maybe_stream_wait(args, uid)
     if final.get("file_path") and args.output:
         _download(final["file_path"], Path(args.output), args.api_url)
     return 0
@@ -242,6 +293,26 @@ def _cmd_list(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
+
+
+
+def _maybe_stream_wait(args: argparse.Namespace, uid: str) -> dict:
+    """Pick the SSE-backed waiter when ``--stream`` is set, else poll."""
+    if args.stream:
+        try:
+            return _wait_via_sse(
+                args.api_url, uid, api_key=args.api_key, timeout=args.timeout,
+            )
+        except SystemExit as e:
+            # SSE endpoint missing or server pre-SSE; fall back to polling.
+            print(f"  SSE not available ({e}); falling back to polling.")
+            return _wait_for_completion(
+                args.api_url, uid, api_key=args.api_key, timeout=args.timeout,
+            )
+    return _wait_for_completion(
+        args.api_url, uid, api_key=args.api_key, timeout=args.timeout,
+    )
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -277,6 +348,10 @@ def _build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--timeout", type=float, default=POLL_TIMEOUT,
         help="Maximum seconds to wait for completion (default: %(default)s)",
+    )
+    common.add_argument(
+        "--stream", action="store_true",
+        help="Use Server-Sent Events to wait for completion (lower latency, fewer requests)",
     )
 
     p = sub.add_parser("text", parents=[common], help="Generate a 3D model from a text prompt")
