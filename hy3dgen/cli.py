@@ -182,6 +182,56 @@ def _download(file_path: str, output: Path, api_url: str) -> None:
 # Subcommands
 # ---------------------------------------------------------------------------
 
+def _cmd_generate(args: argparse.Namespace) -> int:
+    """Unified generation: dispatch to /v1/generate with whatever inputs
+    were provided. The backend infers the mode from the fields that are
+    set.
+    """
+    payload: dict[str, Any] = {
+        "steps": args.steps,
+        "guidance": args.guidance,
+        "octree_resolution": args.octree_resolution,
+        "seed": args.seed,
+        "format": args.format,
+        "texture": args.texture,
+        "face_count": args.face_count,
+        "remove_background": not getattr(args, "no_rembg", False),
+    }
+    if args.text is not None:
+        payload["text"] = args.text
+    if args.image is not None:
+        payload["image"] = _encode_image(Path(args.image))
+    if args.views is not None:
+        payload["views"] = {
+            "front": _encode_image(Path(args.views[0])),
+            "back":  _encode_image(Path(args.views[1])),
+            "left":  _encode_image(Path(args.views[2])),
+            "right": _encode_image(Path(args.views[3])),
+        }
+    if args.mesh is not None:
+        payload["mesh"] = _encode_image(Path(args.mesh))
+
+    if not any([
+        payload.get("text"),
+        payload.get("image"),
+        payload.get("views"),
+        payload.get("mesh"),
+    ]):
+        raise SystemExit(
+            "generate: provide at least one of --text, --image, --views, --mesh"
+        )
+
+    job = _request("POST", f"{args.api_url}/v1/generate", data=payload, api_key=args.api_key)
+    uid = job["uid"]
+    print(f"Submitted {uid}.")
+    final = _maybe_stream_wait(args, uid)
+    if final.get("file_path") and args.output:
+        _download(final["file_path"], Path(args.output), args.api_url)
+    elif not args.output:
+        print(f"  uid: {uid}")
+    return 0
+
+
 def _cmd_text(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = {
         "type": "text_to_3d",
@@ -354,7 +404,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Use Server-Sent Events to wait for completion (lower latency, fewer requests)",
     )
 
-    p = sub.add_parser("text", parents=[common], help="Generate a 3D model from a text prompt")
+    p = sub.add_parser(
+        "generate", parents=[common],
+        help="Unified generation: provide any of --text, --image, --views, --mesh. "
+             "The backend infers the mode from what you supply.",
+    )
+    p.add_argument("--text", help="Text prompt (or guide for image_to_3d)")
+    p.add_argument("--image", help="Path to a single image (image_to_3d / texture reference)")
+    p.add_argument(
+        "--views", nargs=4, metavar=("FRONT", "BACK", "LEFT", "RIGHT"),
+        help="Paths to 4 view images (multiview mode)",
+    )
+    p.add_argument(
+        "--mesh", help="Path to a GLB mesh to re-texture (texture_mesh mode)",
+    )
+    p.add_argument("--no-rembg", action="store_true", help="Skip background removal (image_to_3d)")
+    p.set_defaults(func=_cmd_generate)
+
+    p = sub.add_parser("text", parents=[common], help="[deprecated] Generate a 3D model from a text prompt (use 'generate --text=...')")
     p.add_argument("prompt", help="Text prompt describing the model")
     p.set_defaults(func=_cmd_text)
 

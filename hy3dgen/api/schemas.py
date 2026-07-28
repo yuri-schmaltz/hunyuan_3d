@@ -1,6 +1,6 @@
 from enum import Enum
 from typing import Optional, Literal, Union, Annotated
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 class JobStatus(str, Enum):
     QUEUED = "queued"
@@ -113,3 +113,172 @@ class MeshOpsRequest(BaseModel):
     format: str = Field('glb', description="Output mesh format", examples=['glb'])
     ratio: float = Field(0.5, ge=0.01, le=1.0, description="For decimate: target ratio of faces to keep", examples=[0.5, 0.25])
     model_config = ConfigDict(use_enum_values=True)
+
+
+# ---------------------------------------------------------------------------
+# Unified generation request (PR #7)
+# ---------------------------------------------------------------------------
+
+class _MultiviewViews(BaseModel):
+    """The 4 base64-encoded views used by multiview generation."""
+    model_config = ConfigDict(extra='forbid')
+
+    front: str = Field(..., description="Front view base64 PNG")
+    back: str = Field(..., description="Back view base64 PNG")
+    left: str = Field(..., description="Left view base64 PNG")
+    right: str = Field(..., description="Right view base64 PNG")
+
+
+class GenerationRequest(BaseModel):
+    """Single, unified generation request.
+
+    Inputs are all optional at the type level, but a model validator
+    enforces that at least one of them is provided and that the
+    combination makes sense. The backend infers which generation
+    mode to use from the fields you fill in.
+
+    Inference rules (first match wins):
+        1. ``mesh`` + (any of text/image)      -> texture_mesh
+        2. ``views`` with all 4 sides          -> multiview
+        3. ``image`` (text may also be set)    -> image_to_3d
+        4. ``text`` (or text+image)            -> text_to_3d
+
+    Common parameters (``seed``, ``steps``, ``guidance``, etc.) are
+    applied regardless of mode. ``texture`` is honoured for
+    ``text_to_3d`` and ``image_to_3d``; for ``texture_mesh`` it is
+    forced to True.
+    """
+    model_config = ConfigDict(extra='forbid')
+
+    # --- Inputs (any combination, validated below) -------------------
+    text: Optional[str] = Field(
+        None, description="Text prompt or guidance. Required for text_to_3d.",
+        examples=["a small red cube"],
+    )
+    image: Optional[str] = Field(
+        None, description="Base64-encoded image (single view, used by image_to_3d).",
+    )
+    views: Optional[_MultiviewViews] = Field(
+        None, description="Four base64-encoded views (front/back/left/right).",
+    )
+    mesh: Optional[str] = Field(
+        None, description="Base64-encoded GLB to re-texture (texture_mesh).",
+    )
+
+    # --- Common generation parameters -------------------------------
+    seed: int = Field(1234, description="Random seed", examples=[1234])
+    steps: int = Field(50, ge=1, le=100, description="Denoising steps", examples=[50])
+    guidance: float = Field(5.0, ge=1.0, le=20.0, description="Guidance scale")
+    octree_resolution: int = Field(
+        256, ge=16, le=512, description="Voxel resolution",
+    )
+    format: Literal['glb', 'obj', 'ply', 'stl'] = Field(
+        'glb', description="Output mesh format",
+    )
+    texture: bool = Field(
+        False, description="Generate texture? (Honoured for text_to_3d / image_to_3d; forced on for texture_mesh.)",
+    )
+    face_count: int = Field(
+        40000, ge=100, le=1_000_000, description="Target face count for reduction",
+    )
+    remove_background: bool = Field(
+        True, description="Remove background using rembg? (image_to_3d only.)",
+    )
+
+    # --- Validation -------------------------------------------------
+
+    @model_validator(mode="after")
+    def _check_inputs(self) -> "GenerationRequest":
+        if not any([self.text, self.image, self.views, self.mesh]):
+            raise ValueError(
+                "At least one of `text`, `image`, `views`, `mesh` must be provided."
+            )
+        if self.views is not None and not all(
+            [self.views.front, self.views.back, self.views.left, self.views.right]
+        ):
+            raise ValueError("`views` requires front, back, left, right (all non-empty).")
+        if self.mesh is not None and not (self.text or self.image):
+            raise ValueError(
+                "`mesh` requires a reference: at least one of `text` or `image` must also be set."
+            )
+        return self
+
+    # --- Mode inference + dispatch ----------------------------------
+
+    def infer_mode(self) -> str:
+        """Return the internal mode tag for this request.
+
+        The mapping is deterministic and matches the rules documented
+        on the class. Used by the manager to dispatch to the right
+        internal ``JobRequest`` variant.
+
+        Order of precedence (first match wins):
+            1. ``mesh`` + (any of text/image) -> ``texture_mesh``
+            2. ``views`` with all 4 sides      -> ``multiview``
+            3. ``text`` provided               -> ``text_to_3d``
+               (text wins over image when both are set; image is ignored)
+            4. ``image`` only                  -> ``image_to_3d``
+        """
+        if self.mesh and (self.text or self.image):
+            return "texture_mesh"
+        if self.views is not None:
+            return "multiview"
+        if self.text:
+            return "text_to_3d"
+        return "image_to_3d"
+
+    def to_internal_request(self):
+        """Convert this unified request to the internal ``JobRequest`` variant.
+
+        Returns a ``TextTo3DRequest`` / ``ImageTo3DRequest`` /
+        ``MultiviewRequest`` / ``TextureMeshRequest`` depending on the
+        inferred mode. The manager dispatches based on the resulting
+        ``type`` discriminator.
+        """
+        from typing import cast, Any
+        common = cast("dict[str, Any]", {
+            "seed": self.seed,
+            "steps": self.steps,
+            "guidance": self.guidance,
+            "octree_resolution": self.octree_resolution,
+            "format": self.format,
+            "face_count": self.face_count,
+        })
+        mode = self.infer_mode()
+        if mode == "texture_mesh":
+            assert self.mesh is not None  # guaranteed by validator
+            return TextureMeshRequest(
+                type="texture_mesh",
+                mesh=self.mesh,
+                image=self.image,
+                prompt=self.text,
+                **common,
+            )
+        if mode == "multiview":
+            assert self.views is not None  # validated above
+            return MultiviewRequest(
+                type="multiview",
+                front=self.views.front,
+                back=self.views.back,
+                left=self.views.left,
+                right=self.views.right,
+                **common,
+            )
+        if mode == "image_to_3d":
+            assert self.image is not None  # validated above
+            return ImageTo3DRequest(
+                type="image_to_3d",
+                image=self.image,
+                remove_background=self.remove_background,
+                texture=self.texture,
+                **common,
+            )
+        # text_to_3d
+        assert self.text is not None  # validated above
+        return TextTo3DRequest(
+            type="text_to_3d",
+            prompt=self.text,
+            texture=self.texture,
+            **common,
+        )
+
