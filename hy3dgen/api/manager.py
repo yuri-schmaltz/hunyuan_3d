@@ -54,6 +54,11 @@ class PriorityRequestManager:
         # queue. SSE handlers consume one queue each.
         self._subscribers: Dict[str, list[asyncio.Queue]] = {}
         self._subs_lock = threading.Lock()
+        # List-level subscribers (one queue per consumer). On every job
+        # change we broadcast the current full list to all of these.
+        # Used by the gallery page to update without polling.
+        self._list_subscribers: list[asyncio.Queue] = []
+        self._list_subs_lock = threading.Lock()
 
         # Lazy initialization of the worker to speed up startup
         self.worker: Optional[ModelWorker] = None
@@ -66,24 +71,56 @@ class PriorityRequestManager:
         """Restore jobs from the persistent store into memory.
 
         Returns the number of jobs rehydrated. Active jobs (queued or
-        processing) are requeued with their original priority so they
-        resume after a restart. Terminal jobs are loaded as-is to
-        preserve the history.
+        processing) that have a stored payload are reconstructed and
+        re-queued so they actually resume after a restart. Active jobs
+        that lack a payload (legacy DB, or written by an older version)
+        are marked FAILED with a clear error. Terminal jobs are loaded
+        as-is to preserve the history.
         """
         if self.store is None:
             return 0
+        # Lazy import to avoid a hard dependency at module load.
+        from hy3dgen.api.config import SAVE_DIR
         count = 0
-        for job, _payload in self.store.restore_all():
+        replayed = 0
+        for job, payload in self.store.restore_all():
             self.jobs[job.uid] = job
             count += 1
-            if job.status in (JobStatus.QUEUED, JobStatus.PROCESSING):
-                # Mid-flight jobs that died with the process are
-                # requeued. We don't know the original priority, so
-                # we use a high value (low priority) to make sure we
-                # don't jump in front of anything new.
-                self.queue.put_nowait((100, time.time(), job.uid, None, None))
-                logger.info(f"Re-queued active job {job.uid} after restart.")
-        logger.info(f"Rehydrated {count} jobs from persistent store.")
+            if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                continue
+            if not payload:
+                # Legacy job whose payload wasn't persisted. Mark it
+                # failed so the user can see the reason and resubmit.
+                job.status = JobStatus.FAILED
+                job.error = (
+                    "Server restarted while this job was in-flight and "
+                    "its original request payload was not stored. "
+                    "Please resubmit."
+                )
+                job.completed_at = datetime.utcnow().isoformat()
+                self._persist(job)
+                self._notify(job)
+                logger.warning(f"Cannot replay job {job.uid}: payload missing.")
+                continue
+            try:
+                request = _request_from_payload(payload)
+            except Exception as e:
+                job.status = JobStatus.FAILED
+                job.error = f"Stored payload could not be deserialized: {e}"
+                job.completed_at = datetime.utcnow().isoformat()
+                self._persist(job)
+                self._notify(job)
+                logger.warning(f"Cannot replay job {job.uid}: bad payload ({e}).")
+                continue
+            # Mid-flight jobs use a low priority (high number) so we
+            # don't jump in front of anything new.
+            self.queue.put_nowait((100, time.time(), job.uid, request, SAVE_DIR))
+            replayed += 1
+            logger.info(f"Re-queued active job {job.uid} after restart.")
+        logger.info(
+            f"Rehydrated {count} jobs from persistent store "
+            f"({replayed} re-queued for replay)."
+        )
         return count
 
     async def start(self):
@@ -177,6 +214,7 @@ class PriorityRequestManager:
                 self.store.delete(uid)
         if victims:
             logger.info(f"Evicted {len(victims)} old jobs (older than {max_age_seconds}s).")
+            self._notify_list()
         return len(victims)
 
     def evict_to_size(self) -> int:
@@ -208,6 +246,7 @@ class PriorityRequestManager:
                 self.store.delete(uid)
         if to_remove > 0:
             logger.info(f"Evicted {to_remove} jobs to respect max_history={self.max_history}.")
+            self._notify_list()
         return to_remove
 
     def cancel_job(self, uid: str):
@@ -347,7 +386,9 @@ class PriorityRequestManager:
             logger.warning(f"Failed to persist job {job.uid}: {e}")
 
     def _notify(self, job: JobResponse) -> None:
-        """Fan out a job update to every subscriber of this uid."""
+        """Fan out a job update to every subscriber of this uid, and to
+        list-level subscribers (one event per change, payload is the
+        current full list)."""
         with self._subs_lock:
             queues = list(self._subscribers.get(job.uid, ()))
         for q in queues:
@@ -355,6 +396,31 @@ class PriorityRequestManager:
                 q.put_nowait(job)
             except asyncio.QueueFull:  # pragma: no cover (unbounded queue)
                 logger.warning(f"Subscriber queue full for {job.uid}; dropping event")
+        # Then notify list subscribers with a fresh snapshot.
+        if self._list_subscribers:
+            self._notify_list()
+
+    def _notify_list(self) -> None:
+        """Send the current job list to every list-level subscriber.
+
+        We send the full list (not a diff) so the consumer can simply
+        replace its state. List size is bounded by max_history and the
+        SSE payload is small (one JSON per uid).
+        """
+        with self._list_subs_lock:
+            listeners = list(self._list_subscribers)
+        if not listeners:
+            return
+        snapshot = sorted(
+            self.jobs.values(),
+            key=lambda j: j.created_at or "",
+            reverse=True,
+        )
+        for q in listeners:
+            try:
+                q.put_nowait(snapshot)
+            except asyncio.QueueFull:  # pragma: no cover (unbounded queue)
+                logger.warning("List subscriber queue full; dropping event")
 
     def subscribe(self, uid: str) -> asyncio.Queue:
         """Register a new subscriber for ``uid`` and return its queue.
@@ -385,3 +451,78 @@ class PriorityRequestManager:
                 pass
             if not listeners:
                 self._subscribers.pop(uid, None)
+
+    def subscribe_list(self) -> asyncio.Queue:
+        """Register a new list-level subscriber.
+
+        The first item on the queue is the current snapshot of the
+        in-memory job list, so consumers don't need a separate fetch.
+        Subsequent items are also full snapshots, sorted by created_at
+        desc.
+        """
+        q: asyncio.Queue = asyncio.Queue()
+        with self._list_subs_lock:
+            self._list_subscribers.append(q)
+        # Prime with the current snapshot.
+        q.put_nowait(
+            sorted(
+                self.jobs.values(),
+                key=lambda j: j.created_at or "",
+                reverse=True,
+            )
+        )
+        return q
+
+    def unsubscribe_list(self, queue: asyncio.Queue) -> None:
+        with self._list_subs_lock:
+            try:
+                self._list_subscribers.remove(queue)
+            except ValueError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Rehydration helpers
+# ---------------------------------------------------------------------------
+
+# Map the ``type`` discriminator to the concrete Pydantic model class.
+# We can't use ``TypeAdapter(JobRequest)`` here because the union is
+# declared with ``Annotated[..., Field(discriminator='type')]`` and
+# Pydantic 2.13 has a bug with that combo. Instead we look up the class
+# by name from the JSON tag.
+_REQUEST_CLASSES: dict = {
+    "text_to_3d": None,  # filled in lazily to avoid an import cycle
+    "image_to_3d": None,
+    "multiview": None,
+    "texture_mesh": None,
+}
+
+
+def _request_from_payload(payload: dict):
+    """Reconstruct a JobRequest (or one of its union members) from a dict.
+
+    Used by ``PriorityRequestManager.rehydrate`` to rebuild the original
+    request from a payload we stored in SQLite.
+    """
+    from hy3dgen.api.schemas import (
+        TextTo3DRequest,
+        ImageTo3DRequest,
+        MultiviewRequest,
+        TextureMeshRequest,
+    )
+    if _REQUEST_CLASSES["text_to_3d"] is None:
+        _REQUEST_CLASSES.update({
+            "text_to_3d": TextTo3DRequest,
+            "image_to_3d": ImageTo3DRequest,
+            "multiview": MultiviewRequest,
+            "texture_mesh": TextureMeshRequest,
+        })
+    if not isinstance(payload, dict):
+        raise ValueError(f"Payload is not a dict: {type(payload).__name__}")
+    tag = payload.get("type")
+    if tag not in _REQUEST_CLASSES:
+        raise ValueError(f"Unknown request type: {tag!r}")
+    cls = _REQUEST_CLASSES[tag]
+    if cls is None:
+        raise ValueError(f"Request class for type {tag!r} not registered")
+    return cls.model_validate(payload)
