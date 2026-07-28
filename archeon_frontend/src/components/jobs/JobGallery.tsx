@@ -1,376 +1,497 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { apiClient, BASE_URL } from '../../api/client';
-import { JobStatus } from '../../api/types';
-import type { JobResponse, JobStatusType } from '../../api/types';
-import { RefreshCw, CheckCircle, Clock, XCircle, AlertTriangle, Download, Scissors, X, Eye, EyeOff } from 'lucide-react';
-import { MeshPreview } from './MeshPreview';
-import { useJobEvents } from '../../context/useJobEvents';
-import { useJobStream } from '../../api/useJobStream';
-import { useJobListStream } from '../../api/useJobListStream';
+/**
+ * JobGallery — list of recent jobs.
+ *
+ * Replaces the boxy card grid with a hairline-separated row list.
+ * Each row is a horizontal slab with three zones:
+ *   1. Status glyph (large) on the left.
+ *   2. Job metadata in the middle.
+ *   3. Action buttons on the right.
+ *
+ * Rows hover with a subtle surface change. The status filter is a
+ * row of underline tabs (matching the new ModeChips aesthetic).
+ */
+import React, { useEffect, useRef, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { apiClient, BASE_URL } from "../../api/client";
+import { JobStatus } from "../../api/types";
+import type { JobResponse, JobStatusType } from "../../api/types";
+import { X, Download, Scissors, Eye, EyeOff } from "lucide-react";
+import { MeshPreview } from "./MeshPreview";
+import { useJobEvents } from "../../context/useJobEvents";
+import { useJobStream } from "../../api/useJobStream";
+import {
+  Text,
+  StatusDot,
+  Stack,
+  Button,
+  Divider,
+  Pill,
+  type StatusKind,
+} from "../../design/primitives";
 
 const POLL_INTERVAL_MS = 2000;
-// Cap the exponential backoff so a flapping backend doesn't degrade to multi-minute polls.
 const MAX_POLL_BACKOFF_MS = 30_000;
 
-type StatusFilter = 'all' | JobStatusType;
+type StatusFilter = "all" | JobStatusType;
 
 const STATUS_FILTERS: { key: StatusFilter; label: string }[] = [
-    { key: 'all', label: 'All' },
-    { key: JobStatus.QUEUED, label: 'Queued' },
-    { key: JobStatus.PROCESSING, label: 'Processing' },
-    { key: JobStatus.COMPLETED, label: 'Completed' },
-    { key: JobStatus.FAILED, label: 'Failed' },
-    { key: JobStatus.CANCELLED, label: 'Cancelled' },
+  { key: "all", label: "All" },
+  { key: JobStatus.QUEUED, label: "Queued" },
+  { key: JobStatus.PROCESSING, label: "Processing" },
+  { key: JobStatus.COMPLETED, label: "Completed" },
+  { key: JobStatus.FAILED, label: "Failed" },
+  { key: JobStatus.CANCELLED, label: "Cancelled" },
 ];
 
+const kindByStatus: Record<JobStatusType, StatusKind> = {
+  queued: "queued",
+  processing: "live",
+  completed: "done",
+  failed: "failed",
+  cancelled: "cancelled",
+};
+
 export const JobGallery: React.FC = () => {
-    const [jobs, setJobs] = useState<JobResponse[]>(() => []);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState<string | null>(null);
-    const [previewingUid, setPreviewingUid] = useState<string | null>(null);
-    const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
-    const { job: streamedJob, connected: sseConnected, isFallback: sseFallback } = useJobStream(
-        BASE_URL, previewingUid,
-        { enabled: previewingUid !== null },
+  const [jobs, setJobs] = useState<JobResponse[]>(() => []);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [previewingUid, setPreviewingUid] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+
+  const { job: streamedJob, isFallback: sseFallback, connected: sseConnected } =
+    useJobStream(BASE_URL, previewingUid, {
+      enabled: previewingUid !== null,
+    });
+  const {
+    jobs: streamJobs,
+    isFallback: listIsFallback,
+    connected: listConnected,
+    refetch: refetchList,
+  } = useJobEvents();
+
+  useEffect(() => {
+    setJobs(
+      [...streamJobs].sort(
+        (a, b) =>
+          new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+      ),
     );
-    const {
-        jobs: streamJobs,
-        connected: listConnected,
-        isFallback: listIsFallback,
-        refetch: refetchList,
-    } = useJobListStream(BASE_URL);
-    // Mirror the SSE list into local state. The server already sorts
-    // by created_at desc, but we re-sort to be defensive in case a
-    // caller hands us a different ordering.
-    useEffect(() => {
-        setJobs(
-            [...streamJobs].sort(
-                (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-            ),
-        );
-        setLoading(false);
-    }, [streamJobs]);
+    setLoading(false);
+  }, [streamJobs]);
 
-    const inFlight = useRef(false);
-    // Exponential backoff state for polling after a failure.
-    const consecutiveFailures = useRef(0);
-    // Track the latest submission count from the JobEvents provider so we
-    // can refetch immediately when a new job is submitted elsewhere.
-    const lastSeenSubmission = useRef(0);
-    const { onJobSubmitted, submissionCount } = useJobEvents();
+  const inFlight = useRef(false);
+  const consecutiveFailures = useRef(0);
+  const { onJobSubmitted } = useJobEvents();
+  void refetchList;
 
-    const fetchJobs = async (): Promise<boolean> => {
-        if (inFlight.current) return true; // treated as "ok" so we don't back off
-        inFlight.current = true;
-        try {
-            const res = await apiClient.get<JobResponse[]>('/jobs');
-            setJobs(
-                res.data.sort(
-                    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-                ),
-            );
-            setError(null);
-            consecutiveFailures.current = 0;
-            return true;
-        } catch (err) {
-            consecutiveFailures.current += 1;
-            setError(err instanceof Error ? err.message : 'Failed to load jobs');
-            return false;
-        } finally {
-            inFlight.current = false;
-            setLoading(false);
-        }
+  const fetchJobs = async (): Promise<boolean> => {
+    if (inFlight.current) return true;
+    inFlight.current = true;
+    try {
+      const res = await apiClient.get<JobResponse[]>("/jobs");
+      setJobs(
+        res.data.sort(
+          (a, b) =>
+            new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+        ),
+      );
+      setError(null);
+      consecutiveFailures.current = 0;
+      return true;
+    } catch (err) {
+      consecutiveFailures.current += 1;
+      setError(err instanceof Error ? err.message : "Failed to load jobs");
+      return false;
+    } finally {
+      inFlight.current = false;
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tick = async () => {
+      if (cancelled || document.hidden) {
+        timer = setTimeout(tick, POLL_INTERVAL_MS);
+        return;
+      }
+      const ok = await fetchJobs();
+      const delay = ok
+        ? POLL_INTERVAL_MS
+        : Math.min(
+            POLL_INTERVAL_MS * 2 ** consecutiveFailures.current,
+            MAX_POLL_BACKOFF_MS,
+          );
+      timer = setTimeout(tick, delay);
     };
-
-    useEffect(() => {
-        // Schedule the first fetch on the next tick so the initial setState
-        // doesn't cascade inside the effect body.
-        let cancelled = false;
-        let timer: ReturnType<typeof setTimeout> | null = null;
-
-        const tick = async () => {
-            if (cancelled || document.hidden) {
-                timer = setTimeout(tick, POLL_INTERVAL_MS);
-                return;
-            }
-            const ok = await fetchJobs();
-            const delay = ok
-                ? POLL_INTERVAL_MS
-                : Math.min(
-                    POLL_INTERVAL_MS * 2 ** consecutiveFailures.current,
-                    MAX_POLL_BACKOFF_MS,
-                );
-            timer = setTimeout(tick, delay);
-        };
-
-        timer = setTimeout(tick, 0);
-        return () => {
-            cancelled = true;
-            if (timer) clearTimeout(timer);
-        };
-    }, []);
-
-    // Refetch immediately when another component submits a new job.
-    useEffect(() => {
-        if (submissionCount > lastSeenSubmission.current) {
-            lastSeenSubmission.current = submissionCount;
-            refetchList();
-        }
-    }, [submissionCount]);
-
-    // Allow other components (e.g. CreateJobForm) to trigger an immediate refresh
-    // through the JobEvents provider without prop-drilling.
-    useEffect(() => onJobSubmitted(() => { refetchList(); }), [onJobSubmitted, refetchList]);
-
-    const handleCancel = async (uid: string) => {
-        try {
-            await apiClient.delete(`/jobs/${uid}`);
-            refetchList();
-        } catch (err) {
-            console.error(err);
-            setError(err instanceof Error ? err.message : 'Cancel failed');
-        }
+    timer = setTimeout(tick, 0);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
     };
+  }, []);
 
-    const handleOptimize = async (uid: string) => {
-        try {
-            const res = await apiClient.post<{ file_path: string }>('/meshops/process', {
-                job_uid: uid,
-                action: 'decimate',
-                ratio: 0.5,
-            });
-            const fname = res.data.file_path.split('/').pop();
-            window.open(`${BASE_URL}/files/${encodeURIComponent(fname ?? '')}`, '_blank');
-        } catch (err) {
-            console.error(err);
-            setError(err instanceof Error ? err.message : 'Optimization failed');
-        }
-    };
+  useEffect(
+    () => onJobSubmitted(() => refetchList()),
+    [onJobSubmitted, refetchList],
+  );
 
-    const previewUrl = (job: JobResponse): string | null => {
-        if (!job.file_path) return null;
-        const fname = job.file_path.split(/[\\/]/).pop();
-        return `${BASE_URL}/files/${encodeURIComponent(fname ?? '')}`;
-    };
+  const handleCancel = async (uid: string) => {
+    try {
+      await apiClient.delete(`/jobs/${uid}`);
+      refetchList();
+    } catch (err) {
+      console.error(err);
+      setError(err instanceof Error ? err.message : "Cancel failed");
+    }
+  };
 
-    const getStatusIcon = (status: JobStatusType) => {
-        switch (status) {
-            case JobStatus.COMPLETED: return <CheckCircle size={16} className="text-emerald-400" aria-hidden />;
-            case JobStatus.PROCESSING: return <RefreshCw size={16} className="text-sky-400 animate-spin" aria-hidden />;
-            case JobStatus.FAILED: return <XCircle size={16} className="text-rose-400" aria-hidden />;
-            case JobStatus.QUEUED: return <Clock size={16} className="text-amber-400" aria-hidden />;
-            case JobStatus.CANCELLED: return <XCircle size={16} className="text-gray-500" aria-hidden />;
-            default: return <AlertTriangle size={16} className="text-gray-500" aria-hidden />;
-        }
-    };
+  const handleOptimize = async (uid: string) => {
+    try {
+      const res = await apiClient.post<{ file_path: string }>(
+        "/meshops/process",
+        { job_uid: uid, action: "decimate", ratio: 0.5 },
+      );
+      const fname = res.data.file_path.split("/").pop();
+      window.open(
+        `${BASE_URL}/files/${encodeURIComponent(fname ?? "")}`,
+        "_blank",
+      );
+    } catch (err) {
+      console.error(err);
+      setError(err instanceof Error ? err.message : "Optimization failed");
+    }
+  };
 
-    // Status badge: solid background with white text for WCAG AA contrast.
-    const getStatusBadgeClass = (status: JobStatusType): string => {
-        switch (status) {
-            case JobStatus.COMPLETED: return 'bg-emerald-700 text-white';
-            case JobStatus.PROCESSING: return 'bg-sky-700 text-white';
-            case JobStatus.FAILED: return 'bg-rose-700 text-white';
-            case JobStatus.QUEUED: return 'bg-amber-700 text-white';
-            case JobStatus.CANCELLED: return 'bg-gray-700 text-gray-200';
-            default: return 'bg-gray-700 text-gray-200';
-        }
-    };
+  const previewUrl = (job: JobResponse): string | null => {
+    if (!job.file_path) return null;
+    const fname = job.file_path.split(/[\\/]/).pop();
+    return `${BASE_URL}/files/${encodeURIComponent(fname ?? "")}`;
+  };
 
-    const previewedFromList = previewingUid ? jobs.find((j) => j.uid === previewingUid) ?? null : null;
-    // When the user is previewing a job, prefer the live (SSE/polled)
-    // view of the same job so the GLB appears the moment the backend
-    // marks it completed. Falls back to the cached copy from the list.
-    const previewedJob = previewingUid && streamedJob ? streamedJob : previewedFromList;
+  const previewedFromList = previewingUid
+    ? jobs.find((j) => j.uid === previewingUid) ?? null
+    : null;
+  const previewedJob =
+    previewingUid && streamedJob ? streamedJob : previewedFromList;
 
-    return (
-        <div className="bg-archeon-panel border border-gray-700 rounded-lg p-6 h-full overflow-y-auto max-h-[600px]">
-            <h3 className="text-lg font-semibold mb-4 text-gray-300 flex items-center justify-between sticky top-0 bg-archeon-panel py-2 z-10">
-                <span>Recent Jobs</span>
-                <button
-                    onClick={() => refetchList()}
-                    className="text-gray-500 hover:text-white"
-                    aria-label="Refresh jobs"
-                >
-                    <RefreshCw size={16} />
-                </button>
-                <span
-                    className="text-[10px] text-gray-500 ml-1"
-                    aria-live="polite"
-                    title={listIsFallback ? 'Live updates via polling' : 'Live updates via SSE'}
-                >
-                    <span className={`inline-block w-2 h-2 rounded-full mr-1 ${listConnected ? 'bg-emerald-500' : 'bg-gray-500'}`}></span>
-                    {listIsFallback ? 'polling' : listConnected ? 'live' : 'connecting'}
-                </span>
-                {previewingUid && (
-                    <span
-                        className="text-[10px] text-gray-500 ml-1"
-                        aria-live="polite"
-                        title={sseFallback ? 'Live updates via polling' : 'Live updates via SSE'}
-                    >
-                        <span className={`inline-block w-2 h-2 rounded-full mr-1 ${sseConnected ? 'bg-emerald-500' : 'bg-gray-500'}`}></span>
-                        {sseFallback ? 'polling' : sseConnected ? 'live' : 'connecting'}
-                    </span>
-                )}
-            </h3>
+  const visible =
+    statusFilter === "all"
+      ? jobs
+      : jobs.filter((j) => j.status === statusFilter);
 
-            {/* Status filter tabs. Counts are computed from the in-memory
-                job list so users see at a glance how many of each type
-                they have. */}
-            <div
-                role="tablist"
-                aria-label="Filter jobs by status"
-                className="flex flex-wrap gap-1 mb-3 text-xs"
+  return (
+    <section className="bg-bg">
+      {/* Header */}
+      <div className="flex items-baseline justify-between gap-4 pb-3">
+        <Stack gap={1}>
+          <Text
+            voice="mono"
+            size="2xs"
+            tone="muted"
+            tracking="widest"
+            uppercase
+          >
+            Job stream
+          </Text>
+          <Text voice="display" size="lg" tracking="tight">
+            Recent jobs
+          </Text>
+        </Stack>
+        <Stack direction="row" gap={3} align="center">
+          <Stack direction="row" gap={2} align="center">
+            <StatusDot kind={listConnected ? "live" : "off"} size={5} />
+            <Text
+              voice="mono"
+              size="2xs"
+              tone="muted"
+              tracking="widest"
+              uppercase
             >
-                {STATUS_FILTERS.map((f) => {
-                    const count = f.key === 'all' ? jobs.length : jobs.filter((j) => j.status === f.key).length;
-                    const isActive = statusFilter === f.key;
-                    return (
-                        <button
-                            key={f.key}
-                            role="tab"
-                            aria-selected={isActive}
-                            onClick={() => setStatusFilter(f.key)}
-                            className={`px-2 py-1 rounded transition-colors ${
-                                isActive
-                                    ? 'bg-archeon-primary text-white'
-                                    : 'bg-gray-800 text-gray-400 hover:text-white'
-                            }`}
-                        >
-                            {f.label}
-                            <span className="ml-1 opacity-70">({count})</span>
-                        </button>
-                    );
-                })}
-            </div>
+              {listIsFallback
+                ? "polling"
+                : listConnected
+                ? "live"
+                : "connecting"}
+            </Text>
+          </Stack>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => refetchList()}
+            aria-label="Refresh jobs"
+          >
+            ↻ Refresh
+          </Button>
+        </Stack>
+      </div>
+      <Divider />
 
-            {error && (
-                <div role="alert" className="bg-rose-900/40 text-rose-200 text-sm p-2 rounded mb-3">
-                    {error}
-                </div>
-            )}
+      {/* Status filter row */}
+      <div
+        role="tablist"
+        aria-label="Filter jobs by status"
+        className="flex border-b border-border overflow-x-auto"
+      >
+        {STATUS_FILTERS.map((f) => {
+          const count =
+            f.key === "all"
+              ? jobs.length
+              : jobs.filter((j) => j.status === f.key).length;
+          const isActive = statusFilter === f.key;
+          return (
+            <button
+              key={f.key}
+              role="tab"
+              aria-selected={isActive}
+              onClick={() => setStatusFilter(f.key)}
+              className={
+                "px-4 h-10 flex items-center gap-2 " +
+                "font-mono text-xs uppercase tracking-wider " +
+                "border-b-2 -mb-px transition-colors duration-[120ms] " +
+                (isActive
+                  ? "border-accent text-fg"
+                  : "border-transparent text-fg-muted hover:text-fg")
+              }
+            >
+              <span>{f.label}</span>
+              <Text
+                voice="mono"
+                size="2xs"
+                tone="dim"
+                as="span"
+                className="tabular-nums"
+              >
+                {String(count).padStart(2, "0")}
+              </Text>
+            </button>
+          );
+        })}
+      </div>
 
-            {/* Inline preview when a job is selected for inspection. */}
-            {previewedJob && previewUrl(previewedJob) && (
-                <div className="mb-4">
-                    <div className="flex items-center justify-between mb-2">
-                        <span className="text-xs text-gray-400 font-mono">
-                            Preview · {previewedJob.uid.slice(0, 8)}…
-                        </span>
-                        <button
-                            onClick={() => setPreviewingUid(null)}
-                            className="text-gray-400 hover:text-white"
-                            aria-label="Close preview"
-                        >
-                            <X size={16} />
-                        </button>
-                    </div>
-                    <MeshPreview
-                        src={previewUrl(previewedJob)!}
-                        alt={`Mesh for job ${previewedJob.uid}`}
-                        height={320}
-                    />
-                </div>
-            )}
-
-            <div className="space-y-2">
-                {loading && jobs.length === 0 && (
-                    <div
-                        className="text-gray-500 text-sm animate-pulse"
-                        role="status"
-                        aria-live="polite"
-                    >
-                        Loading jobs…
-                    </div>
-                )}
-
-                {!loading && jobs.length === 0 && !error && (
-                    <p className="text-gray-500 text-sm">No jobs found.</p>
-                )}
-
-                {(() => {
-                    const visible = statusFilter === 'all'
-                        ? jobs
-                        : jobs.filter((j) => j.status === statusFilter);
-                    if (jobs.length > 0 && visible.length === 0) {
-                        return (
-                            <p className="text-gray-500 text-sm">
-                                No jobs match the &ldquo;{STATUS_FILTERS.find((f) => f.key === statusFilter)?.label}&rdquo; filter.
-                            </p>
-                        );
-                    }
-                    return visible.map((job) => {
-                    const isPreviewing = previewingUid === job.uid;
-                    return (
-                        <div
-                            key={job.uid}
-                            className="bg-gray-800/50 p-3 rounded flex items-center justify-between hover:bg-gray-800 transition-colors"
-                        >
-                            <div className="flex items-center gap-3 min-w-0">
-                                {getStatusIcon(job.status)}
-                                <div className="text-sm min-w-0">
-                                    <div className="font-mono text-gray-300 text-xs truncate">
-                                        {job.uid.slice(0, 8)}…
-                                    </div>
-                                    <div className="text-xs text-gray-500">
-                                        {new Date(job.created_at).toLocaleTimeString()}
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div className="flex items-center gap-2 ml-2">
-                                <div
-                                    className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded ${getStatusBadgeClass(job.status)}`}
-                                >
-                                    {job.status}
-                                </div>
-
-                                {job.status === JobStatus.COMPLETED && job.file_path && (
-                                    <div className="flex gap-1">
-                                        <button
-                                            onClick={() => setPreviewingUid(isPreviewing ? null : job.uid)}
-                                            className="p-1.5 hover:bg-gray-700 rounded text-gray-400 hover:text-white transition-colors"
-                                            aria-label={isPreviewing ? 'Hide preview' : 'Show preview'}
-                                            title={isPreviewing ? 'Hide preview' : 'Show preview'}
-                                        >
-                                            {isPreviewing ? <EyeOff size={14} /> : <Eye size={14} />}
-                                        </button>
-                                        <a
-                                            href={previewUrl(job) ?? '#'}
-                                            target="_blank"
-                                            rel="noreferrer noopener"
-                                            className="p-1.5 hover:bg-gray-700 rounded text-gray-400 hover:text-white transition-colors"
-                                            title="Download"
-                                            aria-label="Download mesh"
-                                        >
-                                            <Download size={14} />
-                                        </a>
-                                        <button
-                                            onClick={() => handleOptimize(job.uid)}
-                                            className="p-1.5 hover:bg-gray-700 rounded text-gray-400 hover:text-white transition-colors"
-                                            title="Optimize (Decimate 50%)"
-                                            aria-label="Optimize mesh"
-                                        >
-                                            <Scissors size={14} />
-                                        </button>
-                                    </div>
-                                )}
-
-                                {(job.status === JobStatus.QUEUED || job.status === JobStatus.PROCESSING) && (
-                                    <button
-                                        onClick={() => handleCancel(job.uid)}
-                                        className="p-1.5 hover:bg-rose-700/40 rounded text-gray-400 hover:text-rose-300 transition-colors"
-                                        title="Cancel job"
-                                        aria-label="Cancel job"
-                                    >
-                                        <X size={14} />
-                                    </button>
-                                )}
-                            </div>
-                        </div>
-                    );
-                });
-                })()}
-            </div>
+      {/* Error line */}
+      {error && (
+        <div role="alert" className="py-3">
+          <Pill tone="danger">{error}</Pill>
         </div>
-    );
+      )}
+
+      {/* Preview pane */}
+      <AnimatePresence>
+        {previewedJob && previewUrl(previewedJob) && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] as [number, number, number, number] }}
+            className="overflow-hidden"
+          >
+            <div className="py-4">
+              <div className="flex items-center justify-between mb-2">
+                <Stack direction="row" gap={2} align="center">
+                  <StatusDot
+                    kind={
+                      previewedJob
+                        ? kindByStatus[previewedJob.status]
+                        : "idle"
+                    }
+                  />
+                  <Text
+                    voice="mono"
+                    size="2xs"
+                    tone="muted"
+                    tracking="widest"
+                    uppercase
+                  >
+                    Preview
+                  </Text>
+                  <Text
+                    voice="mono"
+                    size="2xs"
+                    tone="fg"
+                    tracking="wider"
+                  >
+                    {previewedJob.uid.slice(0, 8)}
+                  </Text>
+                  <Text
+                    voice="mono"
+                    size="2xs"
+                    tone="dim"
+                    tracking="wider"
+                  >
+                    {sseFallback ? "· polling" : sseConnected ? "· live" : "· connecting"}
+                  </Text>
+                </Stack>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setPreviewingUid(null)}
+                  aria-label="Close preview"
+                >
+                  Close ×
+                </Button>
+              </div>
+              <MeshPreview
+                src={previewUrl(previewedJob)!}
+                alt={`Mesh for job ${previewedJob.uid}`}
+                height={320}
+              />
+            </div>
+            <Divider />
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* List */}
+      <div className="divide-y divide-border">
+        {loading && jobs.length === 0 && (
+          <div className="py-8 text-center" role="status" aria-live="polite">
+            <Text voice="mono" size="xs" tone="dim" tracking="widest" uppercase>
+              Loading jobs…
+            </Text>
+          </div>
+        )}
+        {!loading && jobs.length === 0 && !error && (
+          <div className="py-8 text-center">
+            <Text voice="mono" size="xs" tone="dim" tracking="widest" uppercase>
+              No jobs found
+            </Text>
+          </div>
+        )}
+        {jobs.length > 0 && visible.length === 0 && (
+          <div className="py-8 text-center">
+            <Text voice="mono" size="xs" tone="dim" tracking="widest" uppercase>
+              No jobs match this filter
+            </Text>
+          </div>
+        )}
+        <AnimatePresence initial={false}>
+          {visible.map((job) => (
+            <JobRow
+              key={job.uid}
+              job={job}
+              isPreviewing={previewingUid === job.uid}
+              onPreviewToggle={() =>
+                setPreviewingUid(previewingUid === job.uid ? null : job.uid)
+              }
+              onCancel={() => handleCancel(job.uid)}
+              onOptimize={() => handleOptimize(job.uid)}
+              previewUrl={previewUrl(job)}
+            />
+          ))}
+        </AnimatePresence>
+      </div>
+    </section>
+  );
+};
+
+// ---------------------------------------------------------------- row
+
+const JobRow: React.FC<{
+  job: JobResponse;
+  isPreviewing: boolean;
+  previewUrl: string | null;
+  onPreviewToggle: () => void;
+  onCancel: () => void;
+  onOptimize: () => void;
+}> = ({ job, isPreviewing, previewUrl, onPreviewToggle, onCancel, onOptimize }) => {
+  const kind = kindByStatus[job.status];
+  const isDone = job.status === JobStatus.COMPLETED;
+  const isCancellable =
+    job.status === JobStatus.QUEUED || job.status === JobStatus.PROCESSING;
+  const time = new Date(job.created_at).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  return (
+    <motion.article
+      layout
+      initial={{ opacity: 0, y: 4 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -4 }}
+      transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] as [number, number, number, number] }}
+      className="group grid grid-cols-[auto_1fr_auto] items-center gap-6 px-2 py-4 hover:bg-surface-1 transition-colors"
+    >
+      <StatusDot kind={kind} size={8} />
+      <div className="min-w-0">
+        <Stack direction="row" gap={3} align="baseline">
+          <Text
+            voice="mono"
+            size="sm"
+            tone="fg"
+            tracking="wider"
+            className="truncate"
+          >
+            {job.uid.slice(0, 8)}
+          </Text>
+          <Pill tone={kind === "done" ? "success" : kind === "failed" ? "danger" : kind === "live" ? "accent" : "neutral"}>
+            {job.status}
+          </Pill>
+        </Stack>
+        <Text
+          voice="mono"
+          size="2xs"
+          tone="dim"
+          tracking="wider"
+          as="div"
+          className="mt-1"
+        >
+          {time} · {job.request_type ?? "unknown"}
+        </Text>
+      </div>
+      <Stack direction="row" gap={2} align="center">
+        {isDone && previewUrl && (
+          <>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onPreviewToggle}
+              aria-label={isPreviewing ? "Hide preview" : "Show preview"}
+              title={isPreviewing ? "Hide preview" : "Show preview"}
+            >
+              {isPreviewing ? <EyeOff size={12} /> : <Eye size={12} />}
+            </Button>
+            <a
+              href={previewUrl}
+              target="_blank"
+              rel="noreferrer noopener"
+              className={
+                "inline-flex items-center justify-center gap-2 h-7 px-3 " +
+                "rounded-sm font-mono uppercase tracking-wider " +
+                "text-[11px] text-fg-muted hover:text-fg hover:bg-surface-2 " +
+                "transition-colors duration-[120ms]"
+              }
+              title="Download"
+              aria-label="Download mesh"
+            >
+              <Download size={12} />
+            </a>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onOptimize}
+              title="Optimize (Decimate 50%)"
+              aria-label="Optimize mesh"
+            >
+              <Scissors size={12} />
+            </Button>
+          </>
+        )}
+        {isCancellable && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onCancel}
+            title="Cancel job"
+            aria-label="Cancel job"
+          >
+            <X size={12} />
+          </Button>
+        )}
+      </Stack>
+    </motion.article>
+  );
 };

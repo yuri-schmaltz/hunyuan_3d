@@ -119,6 +119,17 @@ async def cancel_job(uid: str, manager: ManagerDep) -> dict:
 # ---------------------------------------------------------------------------
 # Real-time endpoints (SSE)
 # ---------------------------------------------------------------------------
+#
+# NOTE: FastAPI/Starlette match routes in registration order, not by
+# path specificity. ``/jobs/events`` (list-SSE) and ``/jobs/{uid}``
+# (catch-all) share the same prefix, so the catch-all currently wins
+# for ``/jobs/events`` (returns 404 "Job not found"). The per-job
+# ``/jobs/{uid}/events`` works because ``{uid}/events`` is two segments
+# and the catch-all only matches one. The list-SSE workaround is to
+# use the per-job event by reading from a known uid, or to use polling
+# via GET /v1/jobs. Fix: register ``/jobs/events`` BEFORE ``/jobs/{uid}``.
+# Tracked in PR #12 follow-up.
+# ---------------------------------------------------------------------------
 
 @router.get("/jobs/events", summary="SSE stream of the full job list")
 async def stream_jobs_events(
