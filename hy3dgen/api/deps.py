@@ -1,6 +1,8 @@
 from fastapi import Request
+
 from hy3dgen.api.manager import PriorityRequestManager
 from hy3dgen.meshops.processor import MeshProcessor
+
 
 async def get_manager(request: Request) -> PriorityRequestManager:
     """Dependency to retrieve the PriorityRequestManager instance."""

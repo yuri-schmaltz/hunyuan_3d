@@ -30,9 +30,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, cast
 from pathlib import Path
-
+from typing import Any, cast
 
 DEFAULT_API_URL = os.environ.get("ARCHEON_API_URL", "http://127.0.0.1:9000")
 DEFAULT_API_KEY = os.environ.get("ARCHEON_API_KEY") or None

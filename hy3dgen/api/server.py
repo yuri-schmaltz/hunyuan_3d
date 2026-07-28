@@ -1,10 +1,13 @@
-from contextlib import asynccontextmanager
 import logging
 import os
+from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
-from fastapi.staticfiles import StaticFiles
+from fastapi import Depends, FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from hy3dgen.api import auth as _auth_module
 from hy3dgen.api.auth import require_api_key
@@ -17,6 +20,7 @@ from hy3dgen.api.config import (
     get_job_db_path,
 )
 from hy3dgen.api.manager import PriorityRequestManager
+from hy3dgen.api.metrics import render_metrics
 from hy3dgen.api.persistence import JobStore
 from hy3dgen.api.routes import router
 from hy3dgen.meshops.processor import MeshProcessor
@@ -49,6 +53,8 @@ async def lifespan(app: FastAPI):
     # Cleanup
     await app.state.manager.stop()
 
+
+limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 
 app = FastAPI(
     title="Archeon 3D Backend",
@@ -123,16 +129,22 @@ async def health_check():
         },
     }
 
+# Make the limiter reachable from request handlers.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics_endpoint() -> Response:
+    """Prometheus text-format metrics. Excluded from the OpenAPI schema
+    (it's an ops endpoint, not part of the public API contract)."""
+    return Response(content=render_metrics(), media_type="text/plain; version=0.0.4")
+
 app.mount("/files", StaticFiles(directory=SAVE_DIR), name="files")
 
 # Apply API-key auth to everything else (the routes registered below).
 # /health is already registered above; FastAPI dependencies apply per-route.
 # The router endpoints protect themselves with ``require_api_key``.
 app.include_router(router, dependencies=[Depends(require_api_key)])
-
-
-if __name__ == "__main__":
-    main()
 
 
 def main():
@@ -142,6 +154,7 @@ def main():
     vars, which themselves default to ``127.0.0.1:8081``.
     """
     import argparse
+
     import uvicorn
     parser = argparse.ArgumentParser(description="Archeon 3D Backend API server")
     parser.add_argument(
@@ -163,3 +176,7 @@ def main():
         port=args.port,
         workers=args.workers,
     )
+
+
+if __name__ == "__main__":
+    main()
