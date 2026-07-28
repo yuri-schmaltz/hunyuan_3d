@@ -35,7 +35,7 @@ accelerate
 gradio
 uvicorn
 fastapi
-mmgp==3.2.7
+mmgp>=3.5.0,<3.8  # pinned to 3.5+ for the new offload profiles; <3.8 avoids breaking model changes introduced in 3.7.x
 rembg
 onnxruntime
 #gevent

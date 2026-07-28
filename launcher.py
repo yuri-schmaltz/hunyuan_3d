@@ -17,6 +17,9 @@ import sys
 import random
 import shutil
 import time
+import threading
+import urllib.error
+import urllib.request
 from glob import glob
 from pathlib import Path
 import webbrowser
@@ -38,9 +41,31 @@ from hy3dgen.shapegen.pipelines import export_to_trimesh
 import logging
 import logging.handlers
 
+# --- Archeon launcher constants ---
+# Resolve the launcher directory once, at import time, so every helper below
+# can build absolute paths regardless of the process' CWD. This is the
+# single source of truth for asset/template locations — fixes the bug
+# where running `python launcher.py` from any other directory silently
+# failed to find ./assets/env_maps, ./assets/example_images, etc.
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(CURRENT_DIR, 'assets')
+
 # --- Unified logging for Archeon Launcher ---
-_XDG_CACHE = os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
-_XDG_STATE = os.environ.get('XDG_STATE_HOME', os.path.expanduser('~/.local/state'))
+# On Windows, prefer %LOCALAPPDATA% (canonical per-user app state dir) over
+# the XDG-style ~/.local/state, which would end up under %USERPROFILE% and
+# be tied to a roaming profile.
+if sys.platform == 'win32':
+    _XDG_STATE = os.environ.get(
+        'LOCALAPPDATA',
+        os.path.join(os.path.expanduser('~'), 'AppData', 'Local'),
+    )
+    _XDG_CACHE = os.environ.get(
+        'LOCALAPPDATA',
+        os.path.join(os.path.expanduser('~'), 'AppData', 'Local'),
+    )
+else:
+    _XDG_CACHE = os.environ.get('XDG_CACHE_HOME', os.path.join(os.path.expanduser('~'), '.cache'))
+    _XDG_STATE = os.environ.get('XDG_STATE_HOME', os.path.join(os.path.expanduser('~'), '.local', 'state'))
 _LOG_DIR = os.path.join(_XDG_STATE, 'hy3dgen')
 os.makedirs(_LOG_DIR, exist_ok=True)
 
@@ -129,12 +154,14 @@ def get_shape_worker():
         # Memory Management for GPU Poor
         replace_property_getter(i23d_worker, "_execution_device", lambda self: "cuda")
         pipe = offload.extract_models("i23d_worker", i23d_worker)
-        
-        profile = int(args.profile)
+
+        # args.profile is now an int (validated by argparse choices=[1..5])
+        # so we don't need to cast it again here.
+        profile = args.profile
         kwargs_offload = {"pinnedMemory": "i23d_worker/model"} if profile < 5 else {}
         if profile != 1 and profile != 3:
             kwargs_offload["budgets"] = {"*": 2200}
-        
+
         offload.default_verboseLevel = int(args.verbose)
         offload.profile(pipe, profile_no=profile, verboseLevel=int(args.verbose), **kwargs_offload)
     return i23d_worker
@@ -148,12 +175,12 @@ def get_texgen_worker():
             logger.info(f"Initializing Texture Generator ({args.texgen_model_path})...")
             texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
             HAS_TEXTUREGEN = True
-            
+
             # Memory Management
             pipe = offload.extract_models("texgen_worker", texgen_worker)
             texgen_worker.models["multiview_model"].pipeline.vae.use_slicing = True
-            
-            profile = int(args.profile)
+
+            profile = args.profile
             kwargs_offload = {}
             if profile != 1 and profile != 3:
                 kwargs_offload["budgets"] = {"*": 2200}
@@ -173,7 +200,7 @@ def get_t2i_worker():
         HAS_T2I = True
         # Memory Management
         pipe = offload.extract_models("t2i_worker", t2i_worker)
-        offload.profile(pipe, profile_no=int(args.profile), verboseLevel=int(args.verbose))
+        offload.profile(pipe, profile_no=args.profile, verboseLevel=int(args.verbose))
     return t2i_worker
 
 
@@ -189,13 +216,13 @@ def get_postprocessors():
 
 def get_example_img_list():
     logger.info('Loading example img list ...')
-    return sorted(glob('./assets/example_images/**/*.png', recursive=True))
+    return sorted(glob(os.path.join(ASSETS_DIR, 'example_images', '**', '*.png'), recursive=True))
 
 
 def get_example_txt_list():
     logger.info('Loading example txt list ...')
     txt_list = list()
-    for line in open('./assets/example_prompts.txt', encoding='utf-8'):
+    for line in open(os.path.join(ASSETS_DIR, 'example_prompts.txt'), encoding='utf-8'):
         txt_list.append(line.strip())
     return txt_list
 
@@ -203,7 +230,7 @@ def get_example_txt_list():
 def get_example_mv_list():
     logger.info('Loading example mv list ...')
     mv_list = list()
-    root = './assets/example_mv_images'
+    root = os.path.join(ASSETS_DIR, 'example_mv_images')
     for mv_dir in os.listdir(root):
         view_list = []
         for view in ['front', 'back', 'left', 'right']:
@@ -224,10 +251,27 @@ def gen_save_folder(max_size=200):
 
     # If directory count exceeds max_size, delete the oldest one
     if len(dirs) >= max_size:
-        # Sort by creation time, oldest first
-        oldest_dir = min(dirs, key=lambda x: x.stat().st_ctime)
-        shutil.rmtree(oldest_dir)
-        logger.info(f"Removed the oldest folder: {oldest_dir}")
+        # max_size <= 0 disables eviction entirely (preserve all jobs).
+        if max_size <= 0:
+            logger.warning(
+                f"Cache directory {SAVE_DIR} has {len(dirs)} folders; "
+                f"--cache-max-size is {max_size} so eviction is disabled. "
+                f"Disk usage will grow unbounded — set --cache-max-size > 0 "
+                f"to enable LRU cleanup."
+            )
+        else:
+            # Sort by creation time, oldest first
+            oldest_dir = min(dirs, key=lambda x: x.stat().st_ctime)
+            try:
+                shutil.rmtree(oldest_dir)
+                logger.warning(
+                    f"Evicted oldest folder {oldest_dir.name} from {SAVE_DIR} "
+                    f"(cache at capacity: {len(dirs)} >= {max_size}). "
+                    f"Increase --cache-max-size if you need to keep more history."
+                )
+            except OSError as e:
+                # Don't crash a generation just because cleanup failed.
+                logger.error(f"Failed to evict {oldest_dir}: {e}")
 
     # Generate a new UUID folder name
     new_folder = os.path.join(SAVE_DIR, str(uuid.uuid4()))
@@ -262,11 +306,11 @@ def build_model_viewer_html(save_folder, height=660, width=790, textured=False):
     # Remove first folder from path to make relative path
     if textured:
         related_path = f"./textured_mesh.glb"
-        template_name = './assets/modelviewer-textured-template.html'
+        template_name = os.path.join(ASSETS_DIR, 'modelviewer-textured-template.html')
         output_html_path = os.path.join(save_folder, f'textured_mesh.html')
     else:
         related_path = f"./white_mesh.glb"
-        template_name = './assets/modelviewer-template.html'
+        template_name = os.path.join(ASSETS_DIR, 'modelviewer-template.html')
         output_html_path = os.path.join(save_folder, f'white_mesh.html')
     offset = 50 if textured else 10
     with open(os.path.join(CURRENT_DIR, template_name), 'r', encoding='utf-8') as f:
@@ -324,7 +368,7 @@ def _gen_shape(
 
     octree_resolution = int(octree_resolution)
     if caption: print('prompt is', caption)
-    save_folder = gen_save_folder()
+    save_folder = gen_save_folder(max_size=args.cache_max_size)
     stats = {
         'model': {
             'shapegen': f'{args.model_path}/{args.subfolder}',
@@ -852,11 +896,11 @@ def build_app():
             print(f'reduce face to {target_face_num}')
             if export_texture:
                 mesh = trimesh.load(file_out2)
-                save_folder = gen_save_folder()
+                save_folder = gen_save_folder(max_size=args.cache_max_size)
                 path = export_mesh(mesh, save_folder, textured=True, type=file_type)
 
                 # for preview
-                save_folder = gen_save_folder()
+                save_folder = gen_save_folder(max_size=args.cache_max_size)
                 _ = export_mesh(mesh, save_folder, textured=True)
                 model_viewer_html = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
                                                              textured=True)
@@ -867,11 +911,11 @@ def build_app():
                 mesh = degenerate_remove(mesh)
                 if reduce_face:
                     mesh = face_reduce(mesh, target_face_num)
-                save_folder = gen_save_folder()
+                save_folder = gen_save_folder(max_size=args.cache_max_size)
                 path = export_mesh(mesh, save_folder, textured=False, type=file_type)
 
                 # for preview
-                save_folder = gen_save_folder()
+                save_folder = gen_save_folder(max_size=args.cache_max_size)
                 _ = export_mesh(mesh, save_folder, textured=False)
                 model_viewer_html = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
                                                              textured=False)
@@ -904,8 +948,19 @@ def main():
     parser.add_argument('--mc_algo', type=str, default='dmc')
     parser.add_argument('--cache-path', type=str,
                         default=os.path.join(_XDG_CACHE, 'hy3dgen', 'launcher'))
+    parser.add_argument(
+        '--cache-max-size', type=int, default=200,
+        help='Maximum number of generation folders to keep in the cache '
+             'directory. When exceeded, the oldest folder is evicted. '
+             'Set to 0 to disable eviction entirely (cache grows unbounded). '
+             'Default: 200.',
+    )
     parser.add_argument('--enable_t23d', action='store_true', default=True)
-    parser.add_argument('--profile', type=str, default="3")
+    parser.add_argument(
+        '--profile', type=int, default=3, choices=[1, 2, 3, 4, 5],
+        help='mmgp offload profile (1=full VRAM, 2-4=tiered, 5=low VRAM). '
+             'Default: 3.',
+    )
     parser.add_argument('--verbose', type=str, default="1")
 
     parser.add_argument('--disable_tex', action='store_true')
@@ -955,8 +1010,9 @@ def main():
             logger.info(f"Update available: {update_info['latest']} → {update_info['url']}")
     except Exception:
         pass
-
-    CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+    # CURRENT_DIR is defined at module load (top of file) so asset paths
+    # resolve correctly even when launcher's helpers are called before
+    # main() runs (e.g. during cold-start path checks).
     MV_MODE = 'mv' in args.model_path
     TURBO_MODE = 'turbo' in args.subfolder
 
@@ -1000,19 +1056,44 @@ def main():
     static_dir = Path(SAVE_DIR).absolute()
     static_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/static", StaticFiles(directory=static_dir, html=True), name="static")
-    shutil.copytree('./assets/env_maps', os.path.join(static_dir, 'env_maps'), dirs_exist_ok=True)
+    shutil.copytree(os.path.join(ASSETS_DIR, 'env_maps'), os.path.join(static_dir, 'env_maps'), dirs_exist_ok=True)
 
     if args.low_vram_mode:
         torch.cuda.empty_cache()
     demo = build_app()
     launcher_app = gr.mount_gradio_app(app, demo, path="/")
 
-    def open_browser():
-        target_url = f"http://{args.host}:{args.port}"
-        logger.info(f"Opening browser at {target_url}")
-        webbrowser.open_new_tab(target_url)
+    target_url = f"http://{args.host}:{args.port}"
 
-    Timer(1.5, open_browser).start()
+    def open_browser_when_ready():
+        # Poll /health until the server is actually accepting connections.
+        # Gradio + FastAPI cold start with model loading can take 20-60s
+        # depending on hardware, so the previous Timer(1.5) raced the server
+        # boot and the user would see ERR_CONNECTION_REFUSED in their browser.
+        deadline = time.monotonic() + 120  # give up after 2 minutes
+        attempt = 0
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(
+                    f"http://{args.host}:{args.port}/health", timeout=1.0
+                ) as r:
+                    if r.status == 200:
+                        logger.info(
+                            f"Server is up after {attempt} health probe(s); "
+                            f"opening browser at {target_url}"
+                        )
+                        webbrowser.open_new_tab(target_url)
+                        return
+            except (urllib.error.URLError, ConnectionError, OSError):
+                # Expected during cold start; back off and retry.
+                attempt += 1
+                time.sleep(0.5)
+        logger.warning(
+            f"Server did not respond to /health within 120s; "
+            f"not opening browser automatically. Visit {target_url} manually."
+        )
+
+    threading.Thread(target=open_browser_when_ready, daemon=True).start()
     uvicorn.run(launcher_app, host=args.host, port=args.port, workers=1)
 
 
