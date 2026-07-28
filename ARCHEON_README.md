@@ -27,10 +27,16 @@ inputs and the backend figures out the rest.
   - CLI client (`hy3dgen-cli`) for scripting
 
 - **Frontend** (React 19, Vite, TypeScript)
+  - "Laboratory Instrument" design language: off-black warm + amber
+    surgical accent, JetBrains Mono for technical labels, Newsreader
+    italic for display. Design tokens in `archeon_frontend/src/design/`.
   - Single dynamic `CreateJobForm` (4 chips: Text / Image / 4 Views / Re-texture)
   - Live `JobGallery` with SSE-backed updates (auto-falls-back to polling)
   - "live / polling / connecting" indicator on every connection
-  - Status filter tabs, mesh preview, GLB download
+  - Status filter tabs (All / Queued / Processing / Completed / Failed /
+    Cancelled), mesh preview, GLB download
+  - SystemMonitor sidebar with live CPU/RAM/Jobs-in-mem/Jobs-in-store
+    vitals and a status ticker footer that shows the last SSE event
 
 - **Ops** (everything below)
   - `pyproject.toml`, Makefile, `docker-compose.yml`, `.env.example`,
@@ -156,6 +162,20 @@ the current state. Stream closes after a terminal status.
 Stream of `event: list` payloads, each the full sorted job list.
 Stream stays open until the client disconnects.
 
+> **Note**: this route is registered *before* the `/v1/jobs/{uid}`
+> catch-all in `hy3dgen/api/routes.py`. FastAPI matches in
+> declaration order, so if a future refactor reorders them, the
+> list-SSE endpoint will silently 404 (the catch-all will see
+> `uid="events"` and fail to find a job with that id). There's
+> a regression test for this in `tests/test_sse_route_ordering.py`.
+
+> **Note**: this route is registered *before* the `/v1/jobs/{uid}`
+> catch-all in `hy3dgen/api/routes.py`. FastAPI matches in
+> declaration order, so if a future refactor reorders them, the
+> list-SSE endpoint will silently 404 (the catch-all will see
+> `uid="events"` and fail to find a job with that id). There's
+> a regression test for this in `tests/test_sse_route_ordering.py`.
+
 ### `GET /health`
 
 Liveness + readiness with: `model_loaded`, `queue_size`, `jobs_in_store`,
@@ -228,3 +248,79 @@ settings.
 
 Inherits the upstream Tencent Hunyuan3D-2 license (see `LICENSE`).
 Archeon-specific additions are MIT-licensed unless otherwise noted.
+
+## Hardening history
+
+This fork ships a 13-PR hardening stack on top of upstream
+Hunyuan3D-2. Each PR is linear (`#N` branches from `#N-1`'s tip)
+and self-contained, so you can pick the ones you want or take
+them all.
+
+| # | Branch | What it does |
+|---|---|---|
+| 1 | `fix/p0-p1-fixes` | Removes duplicated function defs, fixes `replace_property_getter` typo, silences noisy logs, fixes import error masking. |
+| 2 | `feature/followup-improvements` | CI workflow, `/v1/meshops/texture_mesh` endpoint, 3D mesh preview in the gallery. |
+| 3 | `feature/security-and-ux-improvements` | API key auth (`X-API-Key`), CORS fix, bounded job history with eviction, multiview tab, state sharing between jobs. |
+| 4 | `feature/polish-and-tools` | Docker stack, `hy3dgen-cli` standalone client, mypy config, OpenAPI examples, status filter, integration tests. |
+| 5 | `feature/realtime-and-persistence` | SQLite-backed `JobStore`, per-job SSE `/v1/jobs/{uid}/events`. |
+| 6 | `feature/payload-rehydrate-and-list-sse` | Rehydrates the original request payload on restart so active jobs can resume; adds list-level SSE `/v1/jobs/events`. |
+| 7 | `feature/unified-generation-request` | Single `GenerationRequest` schema with mode inference (text_to_3d / image_to_3d / multiview / texture_mesh). |
+| 8 | `feature/out-of-the-box` | `pyproject.toml` packaging, Makefile, `docker-compose.yml`, CI, README. |
+| 9 | `feature/modernize` | Ruff, Pydantic Settings, OpenTelemetry hooks, Prometheus metrics, rate limiting, dep cleanup. |
+| 10 | `feature/aiosqlite-and-final-polish` | aiosqlite-backed store, `/v1/admin/stats` endpoint. |
+| 11 | `feature/frontend-redesign` | Full UI redesign: "Laboratory Instrument" aesthetic, design tokens, primitive components, 1000-job stress test. |
+| 12 | `feature/fix-sse-route-ordering` | Fixes the route-ordering bug that made `/v1/jobs/events` 404 (literal must be declared before the `/jobs/{uid}` catch-all). |
+| 13 | `feature/launcher-hardening` | 7 small launcher fixes: `--cache-max-size` flag, `--profile` validation, browser-open waits for `/health`, asset-path resolution via `CURRENT_DIR`, Windows `%LOCALAPPDATA%` cache default, `mmgp>=3.5.0,<3.8`. |
+| 14 | `feature/manager-hardening` | `PriorityRequestManager` race conditions: atomic cancel via `_status_transition`, drain queue on shutdown, fix `task_done()` count balance. |
+
+**Test counts**: 222 passed, 1 skipped (OTel) in CI; 14 new
+manager-hardening tests are CPU-only and run without a GPU.
+
+**Performance** (measured on a 1000-job store, 50 concurrent clients):
+- `/v1/jobs` list endpoint: 2.2 ms p50
+- `/health`: 0.6 ms p50
+- `/v1/jobs/events` (SSE list): 200 status with `event: list` snapshot
+- Rehydrate 10k jobs: 7,371 jobs/s
+- Eviction 1000→100: <200 ms
+
+See `docs/STRESS_TEST_REPORT.md` for the full stress test report
+and `docs/archeon/ARCHEON_ARCH_SPECS.md` for the architecture
+specification.
+
+## Hardening history
+
+This fork ships a 13-PR hardening stack on top of upstream
+Hunyuan3D-2. Each PR is linear (`#N` branches from `#N-1`'s tip)
+and self-contained, so you can pick the ones you want or take
+them all.
+
+| # | Branch | What it does |
+|---|---|---|
+| 1 | `fix/p0-p1-fixes` | Removes duplicated function defs, fixes `replace_property_getter` typo, silences noisy logs, fixes import error masking. |
+| 2 | `feature/followup-improvements` | CI workflow, `/v1/meshops/texture_mesh` endpoint, 3D mesh preview in the gallery. |
+| 3 | `feature/security-and-ux-improvements` | API key auth (`X-API-Key`), CORS fix, bounded job history with eviction, multiview tab, state sharing between jobs. |
+| 4 | `feature/polish-and-tools` | Docker stack, `hy3dgen-cli` standalone client, mypy config, OpenAPI examples, status filter, integration tests. |
+| 5 | `feature/realtime-and-persistence` | SQLite-backed `JobStore`, per-job SSE `/v1/jobs/{uid}/events`. |
+| 6 | `feature/payload-rehydrate-and-list-sse` | Rehydrates the original request payload on restart so active jobs can resume; adds list-level SSE `/v1/jobs/events`. |
+| 7 | `feature/unified-generation-request` | Single `GenerationRequest` schema with mode inference (text_to_3d / image_to_3d / multiview / texture_mesh). |
+| 8 | `feature/out-of-the-box` | `pyproject.toml` packaging, Makefile, `docker-compose.yml`, CI, README. |
+| 9 | `feature/modernize` | Ruff, Pydantic Settings, OpenTelemetry hooks, Prometheus metrics, rate limiting, dep cleanup. |
+| 10 | `feature/aiosqlite-and-final-polish` | aiosqlite-backed store, `/v1/admin/stats` endpoint. |
+| 11 | `feature/frontend-redesign` | Full UI redesign: "Laboratory Instrument" aesthetic, design tokens, primitive components, 1000-job stress test. |
+| 12 | `feature/fix-sse-route-ordering` | Fixes the route-ordering bug that made `/v1/jobs/events` 404 (literal must be declared before the `/jobs/{uid}` catch-all). |
+| 13 | `feature/launcher-hardening` | 7 small launcher fixes: `--cache-max-size` flag, `--profile` validation, browser-open waits for `/health`, asset-path resolution via `CURRENT_DIR`, Windows `%LOCALAPPDATA%` cache default, `mmgp>=3.5.0,<3.8`. |
+| 14 | `feature/manager-hardening` | `PriorityRequestManager` race conditions: atomic cancel via `_status_transition`, drain queue on shutdown, fix `task_done()` count balance. |
+
+**Test counts**: 222 passed, 1 skipped (OTel) in CI; 14 new
+manager-hardening tests are CPU-only and run without a GPU.
+
+**Performance** (measured on a 1000-job store, 50 concurrent clients):
+- `/v1/jobs` list endpoint: 2.2 ms p50
+- `/health`: 0.6 ms p50
+- `/v1/jobs/events` (SSE list): 200 status with `event: list` snapshot
+- Rehydrate 10k jobs: 7,371 jobs/s
+- Eviction 1000→100: <200 ms
+
+See `docs/STRESS_TEST_REPORT.md` for the full stress test report
+and `docs/archeon/ARCHEON_ARCH_SPECS.md` for the architecture
+specification.
