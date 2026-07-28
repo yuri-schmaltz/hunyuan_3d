@@ -67,6 +67,7 @@ setup(
         'console_scripts': [
             'hy3dgen-api=hy3dgen.api.server:main',
             'hy3dgen-launcher=launcher:main',
+            'hy3dgen-cli=hy3dgen.cli:main',
         ],
     },
     python_requires='>=3.8',

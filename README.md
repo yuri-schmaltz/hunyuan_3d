@@ -61,10 +61,10 @@ e.t.c.
 1) Follow the installation instructions below
 
 2) Enter either one of the commande lines in bash session
- 
+
 To run the Hunyuan3D-2mini (low VRAM) image to 3D generator:
 ```bash
-python launcher.py 
+python launcher.py
 ```
 
 To run the Hunyuan3D-2mv (multi views) image to 3D generator:
@@ -80,6 +80,60 @@ python launcher.py --enable_t23d
 To run the original Hunyuan3D-2 image to 3D generator:
 ```bash
 python launcher.py --h2
+```
+
+## How to run the Archeon API + frontend (split stack)
+
+The `archeon_frontend/` React app talks to the FastAPI backend over HTTP.
+Run them as two separate processes:
+
+```bash
+# Terminal 1 — backend (defaults: 0.0.0.0:9000 if ARCHEON_API_KEY is set, else 127.0.0.1:9000)
+hy3dgen-api --port 9000
+
+# Terminal 2 — frontend dev server (http://localhost:5173)
+cd archeon_frontend
+cp .env.example .env       # then edit VITE_API_URL if your backend is not on 127.0.0.1:9000
+npm install
+npm run dev
+```
+
+The frontend reads `VITE_API_URL` (default `http://localhost:9000`) and
+appends `/v1` to it. See `archeon_frontend/.env.example` for the full list
+of environment variables.
+
+For production:
+
+```bash
+# Build a static bundle
+cd archeon_frontend && npm run build
+
+# Serve the bundle with any static file server (nginx, Caddy, etc.) and
+# point it at the backend. The backend's CORS allow-list is configured
+# via the ARCHEON_CORS_ORIGINS env var (comma-separated origins).
+```
+
+To run the entire stack in Docker, see `docker-compose.yml` at the project
+root:
+
+```bash
+docker compose up --build
+```
+
+To submit a job from the terminal without using the GUI:
+
+```bash
+# Text-to-3D, output to chair.glb:
+hy3dgen-cli text "a red chair" --output chair.glb
+
+# Image-to-3D with background removal:
+hy3dgen-cli image input.png --output model.glb --texture
+
+# Multi-view (4 images, order is front back left right):
+hy3dgen-cli multiview front.png back.png left.png right.png --output model.glb
+
+# Re-texture an existing GLB with a reference image:
+hy3dgen-cli texture-mesh mesh.glb --image ref.png --output textured.glb
 ```
 
 To use the Turbo version of one specific model, add *--turbo*. For instance to run the turbo Hunyuan3D-2mv (multi views) image to 3D generator:

@@ -127,7 +127,16 @@ class TestAuthEnabled:
         # so it must remain reachable without a key.
         r = client.get("/health")
         assert r.status_code == 200
-        assert r.json() == {"status": "ok"}
+        body = r.json()
+        # The endpoint now returns an extended payload; the contract is
+        # ``status == "ok"`` plus the readiness fields.
+        assert body["status"] == "ok"
+        assert "model_loaded" in body
+        assert "queue_size" in body
+        assert "auth_required" in body
+        # When ARCHEON_API_KEY is set (via the monkeypatch above) the
+        # endpoint should reflect that.
+        assert body["auth_required"] is True
 
 
 class TestGetApiKey:

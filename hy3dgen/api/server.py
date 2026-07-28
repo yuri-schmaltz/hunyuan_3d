@@ -5,6 +5,7 @@ from fastapi import Depends, FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
+from hy3dgen.api import auth as _auth_module
 from hy3dgen.api.auth import require_api_key
 from hy3dgen.api.config import SAVE_DIR, get_bind_host, get_cors_origins
 from hy3dgen.api.manager import PriorityRequestManager
@@ -55,7 +56,27 @@ app.add_middleware(
 # without needing the API key.
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    """Liveness + readiness probe.
+
+    Returns 200 with a body that includes:
+    - ``status``: ``"ok"`` if the server is up (even if the model has not loaded yet).
+    - ``model_loaded``: whether the inference worker has been initialized.
+    - ``queue_size``: how many jobs are pending.
+    - ``version``: server version.
+    - ``auth_required``: whether X-API-Key is enforced on /v1/*.
+    - ``last_error``: the most recent worker error, if any. Cleared on success.
+    """
+    manager = getattr(app.state, "manager", None)
+    queue_size = manager.queue.qsize() if manager is not None else 0
+    last_error = getattr(manager, "last_error", None) if manager is not None else None
+    return {
+        "status": "ok",
+        "version": app.version,
+        "model_loaded": manager is not None and manager.worker is not None,
+        "queue_size": queue_size,
+        "auth_required": _auth_module.get_api_key() is not None,
+        "last_error": last_error,
+    }
 
 app.mount("/files", StaticFiles(directory=SAVE_DIR), name="files")
 
