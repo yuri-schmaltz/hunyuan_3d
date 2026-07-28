@@ -19,13 +19,19 @@ class PriorityRequestManager:
     Manages generation requests with priority queuing and resource cleanup.
     Ensures single-threaded execution of model inference to prevent VRAM OOM.
     """
-    def __init__(self, device='cuda', max_concurrent=1):
+    def __init__(self, device='cuda', max_concurrent=1, max_history: int = 1000):
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
         self.jobs: Dict[str, JobResponse] = {}
         self.device = device
         self._shutdown_event = asyncio.Event()
         self._worker_task: Optional[asyncio.Task] = None
-        
+
+        # Cap the in-memory job history so a long-running server doesn't grow
+        # unbounded. Old completed/failed/cancelled jobs are evicted when the
+        # dictionary exceeds ``max_history`` entries. 0 disables the cap.
+        self.max_history = max_history
+        self._evicted_total = 0
+
         # Lazy initialization of the worker to speed up startup
         self.worker: Optional[ModelWorker] = None
         
@@ -74,6 +80,67 @@ class PriorityRequestManager:
 
     def get_job(self, uid: str) -> Optional[JobResponse]:
         return self.jobs.get(uid)
+
+    def evict_old_jobs(self, max_age_seconds: int = 24 * 3600) -> int:
+        """Drop completed/failed/cancelled jobs older than ``max_age_seconds``.
+
+        Active (queued/processing) jobs are never evicted. Returns the number
+        of jobs removed. Call this from a periodic task or after each
+        completed job to keep memory bounded.
+        """
+        cutoff = time.time() - max_age_seconds
+        terminal_statuses = (
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+        )
+        victims: list[tuple[float, str]] = []  # (created_ts, uid)
+        for uid, job in self.jobs.items():
+            if job.status not in terminal_statuses or not job.created_at:
+                continue
+            try:
+                created_ts = datetime.fromisoformat(job.created_at).timestamp()
+            except ValueError:
+                continue
+            if created_ts < cutoff:
+                victims.append((created_ts, uid))
+        # Oldest first; sort ensures determinism when many jobs share a timestamp.
+        victims.sort()
+        for _, uid in victims:
+            del self.jobs[uid]
+            self._evicted_total += 1
+        if victims:
+            logger.info(f"Evicted {len(victims)} old jobs (older than {max_age_seconds}s).")
+        return len(victims)
+
+    def evict_to_size(self) -> int:
+        """If ``max_history`` is set and exceeded, drop the oldest terminal jobs.
+
+        Returns the number evicted.
+        """
+        if self.max_history <= 0 or len(self.jobs) <= self.max_history:
+            return 0
+        terminal_statuses = (
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+        )
+        sortable: list[tuple[str, float]] = []
+        for uid, job in self.jobs.items():
+            if job.status in terminal_statuses and job.created_at:
+                try:
+                    created_ts = datetime.fromisoformat(job.created_at).timestamp()
+                except ValueError:
+                    created_ts = 0.0
+                sortable.append((uid, created_ts))
+        sortable.sort(key=lambda pair: pair[1])  # oldest first
+        to_remove = len(self.jobs) - self.max_history
+        for uid, _ in sortable[:to_remove]:
+            del self.jobs[uid]
+            self._evicted_total += 1
+        if to_remove > 0:
+            logger.info(f"Evicted {to_remove} jobs to respect max_history={self.max_history}.")
+        return to_remove
 
     def cancel_job(self, uid: str):
         if uid in self.jobs:
@@ -168,8 +235,12 @@ class PriorityRequestManager:
             job.completed_at = datetime.utcnow().isoformat()
 
     def _aggressive_cleanup(self):
-        """Perform aggressive garbage collection."""
+        """Perform aggressive garbage collection and bounded history cleanup."""
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+        # Keep the in-memory history bounded. We don't evict on every job
+        # (would be wasteful for short bursts), but we do check periodically.
+        if self.max_history > 0 and len(self.jobs) > self.max_history * 1.2:
+            self.evict_to_size()

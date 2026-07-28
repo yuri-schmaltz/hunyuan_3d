@@ -4,8 +4,11 @@ import { JobStatus } from '../../api/types';
 import type { JobResponse, JobStatusType } from '../../api/types';
 import { RefreshCw, CheckCircle, Clock, XCircle, AlertTriangle, Download, Scissors, X, Eye, EyeOff } from 'lucide-react';
 import { MeshPreview } from './MeshPreview';
+import { useJobEvents } from '../../context/useJobEvents';
 
 const POLL_INTERVAL_MS = 2000;
+// Cap the exponential backoff so a flapping backend doesn't degrade to multi-minute polls.
+const MAX_POLL_BACKOFF_MS = 30_000;
 
 export const JobGallery: React.FC = () => {
     const [jobs, setJobs] = useState<JobResponse[]>(() => []);
@@ -13,9 +16,15 @@ export const JobGallery: React.FC = () => {
     const [error, setError] = useState<string | null>(null);
     const [previewingUid, setPreviewingUid] = useState<string | null>(null);
     const inFlight = useRef(false);
+    // Exponential backoff state for polling after a failure.
+    const consecutiveFailures = useRef(0);
+    // Track the latest submission count from the JobEvents provider so we
+    // can refetch immediately when a new job is submitted elsewhere.
+    const lastSeenSubmission = useRef(0);
+    const { onJobSubmitted, submissionCount } = useJobEvents();
 
-    const fetchJobs = async () => {
-        if (inFlight.current) return; // guard against overlapping polls
+    const fetchJobs = async (): Promise<boolean> => {
+        if (inFlight.current) return true; // treated as "ok" so we don't back off
         inFlight.current = true;
         try {
             const res = await apiClient.get<JobResponse[]>('/jobs');
@@ -25,8 +34,12 @@ export const JobGallery: React.FC = () => {
                 ),
             );
             setError(null);
+            consecutiveFailures.current = 0;
+            return true;
         } catch (err) {
+            consecutiveFailures.current += 1;
             setError(err instanceof Error ? err.message : 'Failed to load jobs');
+            return false;
         } finally {
             inFlight.current = false;
             setLoading(false);
@@ -36,16 +49,42 @@ export const JobGallery: React.FC = () => {
     useEffect(() => {
         // Schedule the first fetch on the next tick so the initial setState
         // doesn't cascade inside the effect body.
-        const initial = setTimeout(fetchJobs, 0);
-        const interval = setInterval(() => {
-            if (document.hidden) return; // pause polling when tab is in background
-            void fetchJobs();
-        }, POLL_INTERVAL_MS);
+        let cancelled = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+
+        const tick = async () => {
+            if (cancelled || document.hidden) {
+                timer = setTimeout(tick, POLL_INTERVAL_MS);
+                return;
+            }
+            const ok = await fetchJobs();
+            const delay = ok
+                ? POLL_INTERVAL_MS
+                : Math.min(
+                    POLL_INTERVAL_MS * 2 ** consecutiveFailures.current,
+                    MAX_POLL_BACKOFF_MS,
+                );
+            timer = setTimeout(tick, delay);
+        };
+
+        timer = setTimeout(tick, 0);
         return () => {
-            clearTimeout(initial);
-            clearInterval(interval);
+            cancelled = true;
+            if (timer) clearTimeout(timer);
         };
     }, []);
+
+    // Refetch immediately when another component submits a new job.
+    useEffect(() => {
+        if (submissionCount > lastSeenSubmission.current) {
+            lastSeenSubmission.current = submissionCount;
+            void fetchJobs();
+        }
+    }, [submissionCount]);
+
+    // Allow other components (e.g. CreateJobForm) to trigger an immediate refresh
+    // through the JobEvents provider without prop-drilling.
+    useEffect(() => onJobSubmitted(() => { void fetchJobs(); }), [onJobSubmitted]);
 
     const handleCancel = async (uid: string) => {
         try {
