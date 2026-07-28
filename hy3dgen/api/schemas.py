@@ -46,8 +46,33 @@ class MultiviewRequest(BaseGenerationRequest):
     right: str = Field(..., description="Right view base64")
 
 
+class TextureMeshRequest(BaseGenerationRequest):
+    """Re-texture an existing mesh (GLB) using either a reference image or a text prompt.
+
+    The mesh is supplied as a base64-encoded ``.glb`` payload; the image (optional)
+    and prompt (optional) steer the texture synthesis. At least one of ``image``
+    or ``prompt`` must be provided. ``texture`` is implicitly true for this job
+    type and is forced to True by the manager before dispatch.
+    """
+    type: Literal['texture_mesh'] = 'texture_mesh'
+    mesh: str = Field(..., description="Base64-encoded GLB of the mesh to re-texture")
+    image: Optional[str] = Field(
+        None, description="Optional base64 image used as the texture reference"
+    )
+    prompt: Optional[str] = Field(
+        None, min_length=1, description="Optional text prompt used as the texture reference"
+    )
+
+    @property
+    def has_reference(self) -> bool:
+        return bool(self.image) or bool(self.prompt)
+
+
 # Discriminated Union for polymorphic handling
-JobRequest = Annotated[Union[TextTo3DRequest, ImageTo3DRequest, MultiviewRequest], Field(discriminator='type')]
+JobRequest = Annotated[
+    Union[TextTo3DRequest, ImageTo3DRequest, MultiviewRequest, TextureMeshRequest],
+    Field(discriminator='type'),
+]
 
 
 class JobResponse(BaseModel):
