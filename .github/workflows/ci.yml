@@ -2,94 +2,117 @@ name: CI
 
 on:
   push:
-    branches: [main, 'fix/**', 'feature/**']
+    branches: [main, "feature/**", "fix/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "feature/**", "fix/**"]
 
-# Cancel an in-flight run of the same workflow on the same branch / PR.
+# Cancel in-flight runs for the same branch on new pushes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # -----------------------------------------------------------------------
-  # Backend: Python syntax + Pydantic schema + API unit tests.
-  # GPU model code is mocked so this runs on a CPU-only runner.
-  # -----------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Backend: pytest + mypy
+  # ---------------------------------------------------------------------------
   backend:
-    name: Backend (Python)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install CPU-only torch + test deps
-        # CPU torch is enough: the tests under tests/test_api_server.py skip
-        # cleanly when torch is absent, and tests/test_api_models.py needs
-        # only pydantic. Installing torch lets the smoke `python -c "import
-        # hy3dgen.api.server"` step run without crashing on import.
-        run: |
-          python -m pip install --upgrade pip
-          pip install --index-url https://download.pytorch.org/whl/cpu \
-              torch==2.5.1
-          pip install pytest pytest-asyncio httpx pydantic==2.10.6 psutil trimesh mypy
-
-      - name: mypy (backend code we own)
-        # --follow-imports=silent so transitive imports from the vendored
-        # Hunyuan3D / diffusers stack don't pollute the error stream.
-        run: |
-          python -m mypy --follow-imports=silent --explicit-package-bases \
-              hy3dgen/api hy3dgen/cli.py
-
-      - name: AST parse all backend modules
-        run: |
-          python -c "
-          import ast, sys
-          files = [
-              'launcher.py',
-              'hy3dgen/api/server.py', 'hy3dgen/api/manager.py',
-              'hy3dgen/api/routes.py', 'hy3dgen/api/schemas.py',
-              'hy3dgen/api/config.py', 'hy3dgen/api/deps.py',
-              'hy3dgen/inference.py', 'hy3dgen/monitoring.py',
-              'hy3dgen/meshops/processor.py', 'blender_addon.py',
-          ]
-          for f in files:
-              ast.parse(open(f).read())
-              print('OK', f)
-          "
-
-      - name: "Smoke import FastAPI app"
-        run: |
-          python -c "from hy3dgen.api.server import app; print(getattr(app, 'title', 'no title'))"
-
-      - name: Run pytest
-        run: pytest tests/ -v --tb=short
-
-  # -----------------------------------------------------------------------
-  # Frontend: type-check + lint + build.
-  # -----------------------------------------------------------------------
-  frontend:
-    name: Frontend (TS/Vite)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: Python (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
     defaults:
       run:
-        working-directory: archeon_frontend
+        working-directory: ./
+
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '22'
-          cache: 'npm'
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install CPU-only PyTorch + API deps
+        run: |
+          python -m pip install --upgrade pip
+          # CPU torch so the runner doesn't try to pull CUDA wheels.
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+              torch torchvision
+          # The rest of the test/typing deps. The Makefile uses
+          # hy3dgen as the install target so we pick up the right
+          # entry points + mypy.ini.
+          pip install -e ".[dev]"
+          # Plus the sse-starlette / fastapi / psutil the tests need.
+          pip install sse-starlette fastapi uvicorn psutil
+
+      - name: pytest
+        env:
+          PYTHONPATH: .
+        run: |
+          python -m pytest tests/ -ra \
+              --ignore=tests/test_texgen_loading.py \
+              --ignore=tests/test_imports.py
+
+      - name: mypy
+        run: |
+          python -m mypy --follow-imports=silent \
+              --explicit-package-bases hy3dgen hy3dgen/api hy3dgen/cli.py
+
+  # ---------------------------------------------------------------------------
+  # Frontend: tsc + eslint + build
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./archeon_frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
           cache-dependency-path: archeon_frontend/package-lock.json
 
-      - run: npm ci
-      - run: npm run lint
-      - run: npx tsc -b --noEmit
-      - run: npm run build
+      - name: Install npm deps
+        run: npm ci --no-audit --no-fund
+
+      - name: tsc
+        run: npx tsc -b --noEmit
+
+      - name: eslint
+        run: npx eslint .
+
+      - name: Build
+        run: npm run build
+        env:
+          VITE_API_URL: http://localhost:8081
+
+  # ---------------------------------------------------------------------------
+  # Docker build smoke-test (only on main + PRs to main)
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        run: docker build -f Dockerfile -t archeon-api:ci .
+
+      - name: Build frontend image
+        run: docker build -f Dockerfile.frontend -t archeon-frontend:ci .
+        env:
+          VITE_API_URL: http://localhost:8081

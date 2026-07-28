@@ -43,15 +43,73 @@ def get_cors_origins() -> list[str]:
     return [origin.strip() for origin in raw.split(',') if origin.strip()]
 
 
-def get_bind_host() -> str:
-    """Default host binding.
 
-    When ``ARCHEON_API_KEY`` is set we assume the server is intended to be
-    reachable from outside the host and bind to ``0.0.0.0``. Without an
-    API key, default to ``127.0.0.1`` to avoid accidentally exposing an
-    unauthenticated instance to the network. Callers can still override
-    with ``--host``.
+def get_log_level() -> str:
+    """Log level from ``ARCHEON_LOG_LEVEL`` (default ``INFO``)."""
+    return os.environ.get('ARCHEON_LOG_LEVEL', 'INFO').upper()
+
+
+def get_log_file() -> str | None:
+    """Optional log file path from ``ARCHEON_LOG_FILE``.
+
+    Empty string disables file logging (stderr only, the default).
     """
+    explicit = os.environ.get('ARCHEON_LOG_FILE')
+    if explicit is None or explicit == '':
+        return None
+    return explicit
+
+
+
+def get_bind_host() -> str:
+    """Bind host for the API server.
+
+    Precedence (highest first):
+        1. ``ARCHEON_HOST`` env var (explicit override; default unset).
+        2. If ``ARCHEON_API_KEY`` is set: ``0.0.0.0`` (you've opted in
+           to expose the API beyond localhost).
+        3. Otherwise: ``127.0.0.1`` (dev / untrusted default).
+    """
+    explicit = os.environ.get('ARCHEON_HOST')
+    if explicit:
+        return explicit
     if os.environ.get('ARCHEON_API_KEY'):
         return '0.0.0.0'
     return '127.0.0.1'
+def get_bind_port() -> int:
+    """Bind port from ``ARCHEON_PORT`` (default ``8081``)."""
+    try:
+        return int(os.environ.get('ARCHEON_PORT', '8081'))
+    except ValueError:
+        return 8081
+
+
+def configure_logging() -> None:
+    """Set up root logging once on startup.
+
+    Honours ``ARCHEON_LOG_LEVEL`` (DEBUG / INFO / WARNING / ERROR) and
+    ``ARCHEON_LOG_FILE`` (optional file path with rotation at 50 MB,
+    keeping 5 backups). Idempotent: safe to call from tests too.
+    """
+    import logging
+    import logging.handlers
+    level = get_log_level()
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    log_file = get_log_file()
+    if log_file:
+        from pathlib import Path
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=50 * 1024 * 1024, backupCount=5,
+                encoding='utf-8',
+            )
+        )
+    fmt = '%(asctime)s %(levelname)-7s [%(name)s] %(message)s'
+    logging.basicConfig(
+        level=level,
+        format=fmt,
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=handlers,
+        force=True,
+    )

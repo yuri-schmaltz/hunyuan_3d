@@ -1,50 +1,76 @@
-# Files excluded from the Docker build context to keep images small and
-# avoid leaking host state into the container.
+# =============================================================================
+# .dockerignore — keep the build context small.
+# =============================================================================
 
 # Git
 .git
 .gitignore
-.worktrees/
+.gitattributes
+
+# Local env files
+.env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtualenvs
 .venv/
 venv/
 env/
-.mypy_cache/
+
+# Test + lint caches
 .pytest_cache/
+.mypy_cache/
 .ruff_cache/
-htmlcov/
 .coverage
+htmlcov/
+.tox/
 
-# Node
-archeon_frontend/node_modules/
-archeon_frontend/dist/
-archeon_frontend/.vite/
-
-# IDE / editor
-.vscode/
+# IDE
 .idea/
-.DS_Store
+.vscode/
+*.swp
+*.swo
 
-# Docker-specific
-Dockerfile
-docker-compose.yml
-.dockerignore
+# Frontend (built inside the image from package.json)
+archeon_frontend/node_modules
+archeon_frontend/dist
 
-# Docs / assets that don't need to ship in the image
+# Worktrees
+.worktrees/
+
+# Docs
 docs/
-assets/example_images/
-assets/example_mv_images/
-assets/qrcode/
 *.md
-LICENSE
-NOTICE
+!ARCHEON_README.md
+!README.md
 
-# Tests (the production image doesn't need them)
-tests/
+# Editor temp
+*.log
+.DS_Store
+Thumbs.db
 
-# Generated model cache (mounted as a volume at runtime instead)
+# Caches
+.huggingface/
 .cache/

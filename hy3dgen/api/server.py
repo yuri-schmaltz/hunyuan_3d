@@ -10,7 +10,9 @@ from hy3dgen.api import auth as _auth_module
 from hy3dgen.api.auth import require_api_key
 from hy3dgen.api.config import (
     SAVE_DIR,
+    configure_logging,
     get_bind_host,
+    get_bind_port,
     get_cors_origins,
     get_job_db_path,
 )
@@ -25,6 +27,8 @@ logger = logging.getLogger("hy3dgen.api.server")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle (start/stop background workers)."""
+    configure_logging()
+    logger.info("Archeon API starting on %s:%s", get_bind_host(), get_bind_port())
     # Initialize the persistent store (or None to disable).
     db_path = get_job_db_path()
     store = JobStore(db_path) if db_path else None
@@ -78,22 +82,45 @@ async def health_check():
 
     Returns 200 with a body that includes:
     - ``status``: ``"ok"`` if the server is up (even if the model has not loaded yet).
-    - ``model_loaded``: whether the inference worker has been initialized.
-    - ``queue_size``: how many jobs are pending.
     - ``version``: server version.
+    - ``model_loaded``: whether the inference worker has been initialized.
+    - ``queue_size``: how many jobs are pending in the priority queue.
+    - ``jobs_in_memory`` / ``jobs_in_store``: how many jobs the manager
+      knows about in each layer (the two numbers can differ briefly
+      during rehydrate).
+    - ``persistence_enabled``: whether SQLite-backed persistence is on.
     - ``auth_required``: whether X-API-Key is enforced on /v1/*.
     - ``last_error``: the most recent worker error, if any. Cleared on success.
+    - ``uptime_seconds``: seconds since this process started.
+    - ``capabilities``: feature flags (SSE endpoints live, etc.).
     """
+    import time
     manager = getattr(app.state, "manager", None)
     queue_size = manager.queue.qsize() if manager is not None else 0
     last_error = getattr(manager, "last_error", None) if manager is not None else None
+    store = getattr(manager, "store", None) if manager is not None else None
+    jobs_in_memory = len(manager.jobs) if manager is not None else 0
+    jobs_in_store = store.count() if store is not None else 0
+    started = getattr(app.state, "started_at", None)
+    if started is None:
+        started = time.monotonic()
+        app.state.started_at = started
     return {
         "status": "ok",
         "version": app.version,
         "model_loaded": manager is not None and manager.worker is not None,
         "queue_size": queue_size,
+        "jobs_in_memory": jobs_in_memory,
+        "jobs_in_store": jobs_in_store,
+        "persistence_enabled": store is not None,
         "auth_required": _auth_module.get_api_key() is not None,
         "last_error": last_error,
+        "uptime_seconds": round(time.monotonic() - started, 1),
+        "capabilities": {
+            "unified_generate_endpoint": True,
+            "sse_per_job": True,
+            "sse_list": True,
+        },
     }
 
 app.mount("/files", StaticFiles(directory=SAVE_DIR), name="files")
@@ -109,12 +136,22 @@ if __name__ == "__main__":
 
 
 def main():
-    """Console entry point declared in setup.py: ``hy3dgen-api``."""
-    import uvicorn
+    """Console entry point declared in pyproject.toml: ``hy3dgen-api``.
+
+    CLI flags take precedence over the ARCHEON_HOST / ARCHEON_PORT env
+    vars, which themselves default to ``127.0.0.1:8081``.
+    """
     import argparse
+    import uvicorn
     parser = argparse.ArgumentParser(description="Archeon 3D Backend API server")
-    parser.add_argument("--port", type=int, default=9000)
-    parser.add_argument("--host", type=str, default=get_bind_host())
+    parser.add_argument(
+        "--port", type=int, default=get_bind_port(),
+        help="Port to listen on (overrides ARCHEON_PORT, default 8081).",
+    )
+    parser.add_argument(
+        "--host", type=str, default=get_bind_host(),
+        help="Bind host (overrides ARCHEON_HOST, default 127.0.0.1).",
+    )
     parser.add_argument(
         "--workers", type=int, default=1,
         help="Number of uvicorn workers. Use >1 only if the model is loaded lazily per worker.",
